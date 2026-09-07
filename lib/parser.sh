@@ -1,93 +1,37 @@
 #!/usr/bin/env bash
-
+#
 # act/lib/parser.sh
 #
-# Generic argument parser for the act CLI library.
+# Generic command-line parser for Bash and Zsh.
 #
-# Compatible with:
-#   - Bash
-#   - Zsh
+# Responsibilities:
+#   - identify the action
+#   - recognize action aliases
+#   - recognize configured subcommands
+#   - recognize configured flags
+#   - preserve positional arguments
+#   - handle `--`
 #
-# The parser knows about:
-#   - actions
-#   - flags
-#   - subcommands
-#   - positional arguments
-#   - `--`
+# It does NOT know what pacman, AUR, Flatpak, etc. mean.
 #
-# It does NOT know what any particular action means.
-#
-# An action library registers its valid subcommands and flags before calling
-# act_parse.
-#
-# Example:
-#
-#   ACT_PARSER_SUBCOMMANDS="pacman aur flatpak web"
-#   ACT_PARSER_FLAGS="--dry-run --quiet"
-#
-#   act_parse "$@"
-#
-# Results:
-#
-#   ACT_PARSED_ACTION
-#   ACT_PARSED_SUBCOMMANDS[]
-#   ACT_PARSED_FLAGS[]
-#   ACT_PARSED_ARGS[]
-#
-# ---------------------------------------------------------------------------
-# Loading guard
-# ---------------------------------------------------------------------------
 
-if [ "${ACT_PARSER_LOADED:-0}" -eq 1 ]; then
-    return 0 2>/dev/null || exit 0
+if [[ -n "${ACT_PARSER_LOADED:-}" ]]; then
+    return 0
 fi
 
 ACT_PARSER_LOADED=1
 
-# ---------------------------------------------------------------------------
-# Parser configuration
-# ---------------------------------------------------------------------------
-#
-# The caller changes these before invoking act_parse.
-#
-# Example:
-#
-#   ACT_PARSER_SUBCOMMANDS="pacman aur flatpak web"
-#   ACT_PARSER_FLAGS="-p -a -f -w"
-#
-# Long and short forms are both supported.
-#
-# A token is considered a subcommand only while the parser is still in the
-# subcommand portion of the command line.
-#
-# Once the first positional argument is encountered, subsequent matching
-# words are treated as arguments.
-#
-# Therefore:
-#
-#   install pacman aur firefox
-#
-# becomes:
-#
-#   subcommands = pacman aur
-#   args        = firefox
-#
-# While:
-#
-#   install -- pacman
-#
-# becomes:
-#
-#   args = pacman
-#
-# This makes it possible to install an application literally named
-# "pacman" by using `--`.
 
-ACT_PARSER_SUBCOMMANDS="${ACT_PARSER_SUBCOMMANDS:-}"
-ACT_PARSER_FLAGS="${ACT_PARSER_FLAGS:-}"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-# Optional action name supplied by the caller.
 ACT_PARSER_ACTION="${ACT_PARSER_ACTION:-}"
+
+ACT_PARSER_ACTIONS=()
+ACT_PARSER_FLAGS=()
+ACT_PARSER_SUBCOMMANDS=()
+
 
 # ---------------------------------------------------------------------------
 # Parsed state
@@ -98,331 +42,364 @@ ACT_PARSED_SUBCOMMANDS=()
 ACT_PARSED_FLAGS=()
 ACT_PARSED_ARGS=()
 
-# Whether `--` was encountered.
 ACT_PARSED_END_OF_OPTIONS=0
 
+
 # ---------------------------------------------------------------------------
-# Reset
+# Alias support
 # ---------------------------------------------------------------------------
 
-act_parser_reset() {
+ACT_PARSER_ALIASES_LOADED=0
+
+
+act_parser_load_aliases()
+{
+    local library_root
+    local alias_file
+
+    [[ "$ACT_PARSER_ALIASES_LOADED" -eq 1 ]] && return 0
+
+    library_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    alias_file="$library_root/tools/alias/alias.sh"
+
+    if [[ -f "$alias_file" ]]; then
+        # shellcheck disable=SC1090
+        source "$alias_file"
+    fi
+
+    ACT_PARSER_ALIASES_LOADED=1
+}
+
+
+# ---------------------------------------------------------------------------
+# Reset parser state
+# ---------------------------------------------------------------------------
+
+act_parser_reset()
+{
     ACT_PARSED_ACTION=""
     ACT_PARSED_SUBCOMMANDS=()
     ACT_PARSED_FLAGS=()
     ACT_PARSED_ARGS=()
+
     ACT_PARSED_END_OF_OPTIONS=0
 }
 
+
 # ---------------------------------------------------------------------------
-# Membership helpers
+# Generic list helper
 # ---------------------------------------------------------------------------
 
-act_parser_list_contains() {
-    local needle="$1"
+act_parser_list_contains()
+{
+    local wanted="${1:-}"
     shift
 
     local item
 
     for item in "$@"; do
-        if [ "$item" = "$needle" ]; then
-            return 0
-        fi
+        [[ "$item" == "$wanted" ]] && return 0
     done
 
     return 1
 }
 
-act_parser_subcommand_allowed() {
-    local value="$1"
-    local item
-
-    for item in $ACT_PARSER_SUBCOMMANDS; do
-        if [ "$item" = "$value" ]; then
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-act_parser_flag_allowed() {
-    local value="$1"
-    local item
-
-    for item in $ACT_PARSER_FLAGS; do
-        if [ "$item" = "$value" ]; then
-            return 0
-        fi
-    done
-
-    return 1
-}
 
 # ---------------------------------------------------------------------------
-# Parse one token
+# Configuration checks
 # ---------------------------------------------------------------------------
 
-act_parser_handle_token() {
-    local token="$1"
-    local subcommands_started="$2"
+act_parser_subcommand_allowed()
+{
+    local token="${1:-}"
 
-    # -----------------------------------------------------------------------
-    # End of options / subcommands.
-    # -----------------------------------------------------------------------
+    act_parser_list_contains \
+        "$token" \
+        "${ACT_PARSER_SUBCOMMANDS[@]}"
+}
 
-    if [ "$token" = "--" ]; then
-        ACT_PARSED_END_OF_OPTIONS=1
-        return 0
-    fi
 
-    # -----------------------------------------------------------------------
-    # After `--`, everything is an argument.
-    # -----------------------------------------------------------------------
+act_parser_flag_allowed()
+{
+    local token="${1:-}"
 
-    if [ "$ACT_PARSED_END_OF_OPTIONS" -eq 1 ]; then
+    act_parser_list_contains \
+        "$token" \
+        "${ACT_PARSER_FLAGS[@]}"
+}
+
+
+act_parser_action_allowed()
+{
+    local token="${1:-}"
+
+    act_parser_list_contains \
+        "$token" \
+        "${ACT_PARSER_ACTIONS[@]}"
+}
+
+
+# ---------------------------------------------------------------------------
+# Alias expansion helpers
+# ---------------------------------------------------------------------------
+#
+# Alias config entries are:
+#
+#   alias -> canonical command
+#
+# The canonical command may contain multiple tokens.
+#
+# Example:
+#
+#   paci -> "pacman -S"
+#
+# Input:
+#
+#   paci firefox
+#
+# becomes:
+#
+#   pacman -S firefox
+#
+# Alias expansion happens once per token and is deliberately non-recursive.
+# This prevents accidental alias loops.
+#
+
+ACT_PARSER_EXPANDED_ARGS=()
+
+
+act_parser_split_command()
+{
+    local command="${1:-}"
+
+    # shellcheck disable=SC2206
+    ACT_PARSER_SPLIT_RESULT=($command)
+}
+
+
+act_parser_expand_aliases()
+{
+    local token
+    local canonical
+    local expanded=()
+
+    act_parser_load_aliases
+
+    ACT_PARSER_EXPANDED_ARGS=()
+
+    for token in "$@"; do
+
+        if declare -F act_alias_lookup >/dev/null 2>&1 &&
+           canonical="$(act_alias_lookup "$token")"; then
+
+            act_parser_split_command "$canonical"
+
+            expanded+=(
+                "${ACT_PARSER_SPLIT_RESULT[@]}"
+            )
+        else
+            expanded+=("$token")
+        fi
+    done
+
+    ACT_PARSER_EXPANDED_ARGS=(
+        "${expanded[@]}"
+    )
+}
+
+
+# ---------------------------------------------------------------------------
+# Handle one token
+# ---------------------------------------------------------------------------
+
+act_parser_handle_token()
+{
+    local token="${1:-}"
+    local action_set=0
+
+    # ---------------------------------------------------------------
+    # End of options
+    # ---------------------------------------------------------------
+
+    if [[ "$ACT_PARSED_END_OF_OPTIONS" -eq 1 ]]; then
         ACT_PARSED_ARGS+=("$token")
         return 0
     fi
 
-    # -----------------------------------------------------------------------
-    # Explicit flags.
-    # -----------------------------------------------------------------------
-
-    if act_parser_flag_allowed "$token"; then
-        ACT_PARSED_FLAGS+=("$token")
+    if [[ "$token" == "--" ]]; then
+        ACT_PARSED_END_OF_OPTIONS=1
         return 0
     fi
 
-    # -----------------------------------------------------------------------
-    # Short flag clusters.
+    # ---------------------------------------------------------------
+    # Action
+    # ---------------------------------------------------------------
     #
-    # Example:
-    #
-    #   -paf
-    #
-    # becomes:
-    #
-    #   -p
-    #   -a
-    #   -f
-    #
-    # This is enabled only when every individual character corresponds to
-    # a registered short flag.
-    # -----------------------------------------------------------------------
-
-    case "$token" in
-        -?*)
-            if [ "${#token}" -gt 2 ]; then
-                local cluster
-                local i
-                local short_flag
-
-                cluster="${token#-}"
-                i=1
-
-                while [ "$i" -le "${#cluster}" ]; do
-                    short_flag="-${cluster:$((i - 1)):1}"
-
-                    if ! act_parser_flag_allowed "$short_flag"; then
-                        break
-                    fi
-
-                    i=$((i + 1))
-                done
-
-                if [ "$i" -gt "${#cluster}" ]; then
-                    i=1
-
-                    while [ "$i" -le "${#cluster}" ]; do
-                        short_flag="-${cluster:$((i - 1)):1}"
-                        ACT_PARSED_FLAGS+=("$short_flag")
-                        i=$((i + 1))
-                    done
-
-                    return 0
-                fi
-            fi
-            ;;
-    esac
-
-    # -----------------------------------------------------------------------
-    # Registered subcommands.
-    #
-    # Subcommands are only recognized before the first application/positional
+    # The action is recognized only before the first positional
     # argument.
-    # -----------------------------------------------------------------------
+    #
 
-    if [ "$subcommands_started" -eq 1 ]; then
-        if act_parser_subcommand_allowed "$token"; then
-            ACT_PARSED_SUBCOMMANDS+=("$token")
+    if [[ -z "$ACT_PARSED_ACTION" ]]; then
+
+        if [[ -n "$ACT_PARSER_ACTION" &&
+              "$token" == "$ACT_PARSER_ACTION" ]]; then
+
+            ACT_PARSED_ACTION="$token"
+            return 0
+        fi
+
+        if act_parser_action_allowed "$token"; then
+            ACT_PARSED_ACTION="$token"
             return 0
         fi
     fi
 
-    # -----------------------------------------------------------------------
-    # Everything else is a positional argument.
-    # -----------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Flags
+    # ---------------------------------------------------------------
+
+    if [[ "$token" == -* && "$token" != "-" ]]; then
+
+        # Exact configured flag.
+        if act_parser_flag_allowed "$token"; then
+            ACT_PARSED_FLAGS+=("$token")
+            return 0
+        fi
+
+        # Short flag cluster.
+        #
+        # Example:
+        #
+        #   -paf
+        #
+        # becomes:
+        #
+        #   -p -a -f
+        #
+
+        if [[ "$token" =~ ^-[^-].+ ]]; then
+            local cluster="${token#-}"
+            local i
+            local flag
+            local valid=1
+
+            for ((i = 0; i < ${#cluster}; i++)); do
+                flag="-${cluster:i:1}"
+
+                if ! act_parser_flag_allowed "$flag"; then
+                    valid=0
+                    break
+                fi
+            done
+
+            if [[ "$valid" -eq 1 ]]; then
+                for ((i = 0; i < ${#cluster}; i++)); do
+                    ACT_PARSED_FLAGS+=(
+                        "-${cluster:i:1}"
+                    )
+                done
+
+                return 0
+            fi
+        fi
+
+        # Unknown options are preserved as arguments rather than
+        # silently discarded.
+        ACT_PARSED_ARGS+=("$token")
+        return 0
+    fi
+
+    # ---------------------------------------------------------------
+    # Subcommand
+    # ---------------------------------------------------------------
+    #
+    # Subcommands are recognized only before the first positional
+    # argument.
+    #
+
+    if [[ "${#ACT_PARSED_ARGS[@]}" -eq 0 ]] &&
+       act_parser_subcommand_allowed "$token"; then
+
+        ACT_PARSED_SUBCOMMANDS+=("$token")
+        return 0
+    fi
+
+    # ---------------------------------------------------------------
+    # Positional argument
+    # ---------------------------------------------------------------
 
     ACT_PARSED_ARGS+=("$token")
-
-    return 0
 }
+
 
 # ---------------------------------------------------------------------------
 # Main parser
 # ---------------------------------------------------------------------------
-#
-# Usage:
-#
-#   ACT_PARSER_SUBCOMMANDS="pacman aur flatpak web"
-#   ACT_PARSER_FLAGS="-p -a -f -w --dry-run"
-#   act_parse "$@"
-#
-# The first positional token can optionally be treated as the action when
-# ACT_PARSER_ACTION is empty.
-#
-# Example:
-#
-#   act_parse install pacman firefox
-#
-# produces:
-#
-#   ACTION       = install
-#   SUBCOMMANDS  = pacman
-#   ARGS         = firefox
-#
-# If the caller already knows the action:
-#
-#   ACT_PARSER_ACTION=install
-#   act_parse pacman firefox
-#
-# produces the same result.
 
-act_parse() {
+act_parse()
+{
+    local token
+
     act_parser_reset
 
-    local token
-    local first_token=1
-    local subcommands_started=1
+    act_parser_expand_aliases "$@"
 
-    # -----------------------------------------------------------------------
-    # Determine action.
-    # -----------------------------------------------------------------------
-
-    if [ -n "$ACT_PARSER_ACTION" ]; then
-        ACT_PARSED_ACTION="$ACT_PARSER_ACTION"
-    elif [ "$#" -gt 0 ]; then
-        case "$1" in
-            -*)
-                ;;
-            *)
-                ACT_PARSED_ACTION="$1"
-                shift
-                ;;
-        esac
-    fi
-
-    # -----------------------------------------------------------------------
-    # Parse remaining tokens.
-    # -----------------------------------------------------------------------
-
-    for token in "$@"; do
-        # Once a positional argument has appeared, we no longer interpret
-        # source/subcommand names as subcommands.
-        #
-        # Flags remain valid after positional arguments.
-        #
-        # This allows:
-        #
-        #   install firefox -p
-        #
-        # while preventing:
-        #
-        #   install firefox pacman
-        #
-        # from silently changing `pacman` into a source selector.
-
-        if [ "$subcommands_started" -eq 1 ]; then
-            case "$token" in
-                -*)
-                    act_parser_handle_token "$token" 1
-                    ;;
-
-                *)
-                    if act_parser_subcommand_allowed "$token"; then
-                        act_parser_handle_token "$token" 1
-                    else
-                        subcommands_started=0
-                        act_parser_handle_token "$token" 0
-                    fi
-                    ;;
-            esac
-        else
-            act_parser_handle_token "$token" 0
-        fi
-
-        first_token=0
+    for token in "${ACT_PARSER_EXPANDED_ARGS[@]}"; do
+        act_parser_handle_token "$token"
     done
 
     return 0
 }
 
+
 # ---------------------------------------------------------------------------
-# Validation helpers
+# Require action
 # ---------------------------------------------------------------------------
 
-act_parser_require_action() {
-    local expected="$1"
-
-    if [ "$ACT_PARSED_ACTION" != "$expected" ]; then
+act_parser_require_action()
+{
+    if [[ -z "$ACT_PARSED_ACTION" ]]; then
+        act_error "No action specified."
         return 1
     fi
 
     return 0
 }
 
-act_parser_has_subcommand() {
-    local needle="$1"
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+act_parser_has_subcommand()
+{
+    local wanted="${1:-}"
 
     act_parser_list_contains \
-        "$needle" \
+        "$wanted" \
         "${ACT_PARSED_SUBCOMMANDS[@]}"
 }
 
-act_parser_has_flag() {
-    local needle="$1"
+
+act_parser_has_flag()
+{
+    local wanted="${1:-}"
 
     act_parser_list_contains \
-        "$needle" \
+        "$wanted" \
         "${ACT_PARSED_FLAGS[@]}"
 }
 
-# ---------------------------------------------------------------------------
-# Flag aliases
-# ---------------------------------------------------------------------------
-#
-# Useful when an action wants:
-#
-#   install == -i
-#
-# without making the parser itself understand that relationship.
-#
-# Example:
-#
-#   act_parser_flag_matches install -i "$ACT_PARSED_FLAGS"
-#
-# returns success if either form is present.
 
-act_parser_flag_matches() {
-    local long_form="$1"
-    local short_form="$2"
-    shift 2
+act_parser_flag_matches()
+{
+    local wanted="${1:-}"
+    shift
 
     local flag
 
     for flag in "$@"; do
-        if [ "$flag" = "$long_form" ] ||
-           [ "$flag" = "$short_form" ]; then
+        if [[ "$flag" == "$wanted" ]]; then
             return 0
         fi
     done
@@ -430,31 +407,16 @@ act_parser_flag_matches() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# Subcommand aliases
-# ---------------------------------------------------------------------------
-#
-# Same idea as flag aliases.
-#
-# Example:
-#
-#   act_parser_subcommand_matches pacman -p "$ACT_PARSED_SUBCOMMANDS"
-#
-# Note that the parser should normally register both forms as valid
-# subcommands if both are supposed to be accepted directly.
-#
-# This helper is useful when the implementation wants to normalize them.
 
-act_parser_subcommand_matches() {
-    local long_form="$1"
-    local short_form="$2"
-    shift 2
+act_parser_subcommand_matches()
+{
+    local wanted="${1:-}"
+    shift
 
     local subcommand
 
     for subcommand in "$@"; do
-        if [ "$subcommand" = "$long_form" ] ||
-           [ "$subcommand" = "$short_form" ]; then
+        if [[ "$subcommand" == "$wanted" ]]; then
             return 0
         fi
     done
@@ -462,82 +424,59 @@ act_parser_subcommand_matches() {
     return 1
 }
 
+
 # ---------------------------------------------------------------------------
-# Normalization
+# Normalize subcommands
 # ---------------------------------------------------------------------------
 #
-# Convert aliases into canonical values.
+# This function intentionally does nothing by default.
 #
-# This is intentionally separate from parsing.
+# Action-specific normalization belongs to the action module.
 #
-# Parser:
+# For install, lib/install.sh can turn:
 #
-#   preserves what the user typed
+#   -p -> pacman
+#   -a -> aur
+#   -f -> flatpak
+#   -w -> web
 #
-# Normalizer:
+# This keeps parser.sh generic.
 #
-#   converts aliases to canonical internal names
-#
-# This distinction is useful for error messages and future command logging.
 
-act_parser_normalize_subcommands() {
-    local -a normalized
-    local item
-
-    normalized=()
-
-    for item in "${ACT_PARSED_SUBCOMMANDS[@]}"; do
-        case "$item" in
-            pacman|-p)
-                normalized+=("pacman")
-                ;;
-
-            aur|-a)
-                normalized+=("aur")
-                ;;
-
-            flatpak|-f)
-                normalized+=("flatpak")
-                ;;
-
-            web|-w)
-                normalized+=("web")
-                ;;
-
-            *)
-                normalized+=("$item")
-                ;;
-        esac
-    done
-
-    ACT_PARSED_SUBCOMMANDS=("${normalized[@]}")
+act_parser_normalize_subcommands()
+{
+    return 0
 }
 
+
 # ---------------------------------------------------------------------------
-# Debug dump
+# Dump parser state
 # ---------------------------------------------------------------------------
 
-act_parser_dump() {
-    printf 'action: %s\n' "$ACT_PARSED_ACTION"
+act_parser_dump()
+{
+    printf 'action: %s\n' \
+        "$ACT_PARSED_ACTION"
 
-    printf 'subcommands:\n'
+    printf 'subcommands:'
+
     local item
 
     for item in "${ACT_PARSED_SUBCOMMANDS[@]}"; do
-        printf '  %s\n' "$item"
+        printf ' %s' "$item"
     done
 
-    printf 'flags:\n'
+    printf '\nflags:'
 
     for item in "${ACT_PARSED_FLAGS[@]}"; do
-        printf '  %s\n' "$item"
+        printf ' %s' "$item"
     done
 
-    printf 'args:\n'
+    printf '\nargs:'
 
     for item in "${ACT_PARSED_ARGS[@]}"; do
-        printf '  %s\n' "$item"
+        printf ' %s' "$item"
     done
 
-    printf 'end_of_options: %s\n' "$ACT_PARSED_END_OF_OPTIONS"
+    printf '\n'
 }
