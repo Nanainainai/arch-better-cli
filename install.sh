@@ -2,10 +2,10 @@
 
 # act/install.sh
 #
-# Installer for the act CLI library.
+# Bootstrap installer for the act CLI library.
 #
-# This script installs the library and its shell integration.
-# It does NOT implement the `install` action itself.
+# This script installs the act library itself.
+# It does NOT implement the runtime `install` action.
 #
 # Supported shells:
 #   - Bash
@@ -15,13 +15,16 @@
 #
 #   ./install.sh
 #   ./install.sh --prefix ~/.local
-#   ./install.sh --uninstall
+#   ./install.sh --no-shell-config
+#
+# Uninstallation is handled by:
+#
+#   ./uninstall.sh
 #
 # After installation:
 #
-#   source ~/.local/share/act/act.sh
-#
-# or let the installer add the appropriate shell initialization.
+#   act --help
+#   install --help
 
 set -e
 
@@ -34,7 +37,6 @@ ACT_NAME="act"
 DEFAULT_PREFIX="${HOME}/.local"
 PREFIX="$DEFAULT_PREFIX"
 
-UNINSTALL=0
 NO_SHELL_CONFIG=0
 VERBOSE=0
 
@@ -75,7 +77,6 @@ Usage:
 Options:
     --prefix DIR       Installation prefix
     --no-shell-config  Do not modify shell configuration
-    --uninstall        Remove act
     -v, --verbose      Verbose output
     -h, --help         Show this help
 
@@ -84,10 +85,14 @@ Default prefix:
 
 Installed files:
     ~/.local/share/act/
-    ~/.local/bin/install
     ~/.local/bin/act
+    ~/.local/bin/install
 
-The installed library can be used from both Bash and Zsh.
+The installed CLI works from both Bash and Zsh.
+
+Uninstallation:
+    ./uninstall.sh
+    ./uninstall.sh --prefix ~/.local
 EOF
 }
 
@@ -115,11 +120,6 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
 
-        --uninstall)
-            UNINSTALL=1
-            shift
-            ;;
-
         -v|--verbose)
             VERBOSE=1
             shift
@@ -143,9 +143,8 @@ done
 ACT_LIB_DIR="${PREFIX}/share/${ACT_NAME}"
 ACT_BIN_DIR="${PREFIX}/bin"
 
-ACT_INIT_FILE="${ACT_LIB_DIR}/act.sh"
-ACT_COMMAND="${ACT_BIN_DIR}/act"
-INSTALL_COMMAND="${ACT_BIN_DIR}/install"
+ACT_MAIN="${ACT_BIN_DIR}/act"
+ACT_INSTALL="${ACT_BIN_DIR}/install"
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -154,14 +153,26 @@ INSTALL_COMMAND="${ACT_BIN_DIR}/install"
 [ -d "$SCRIPT_DIR" ] ||
     error "could not determine project directory"
 
-[ -f "$SCRIPT_DIR/act.sh" ] ||
-    error "missing act.sh"
-
 [ -d "$SCRIPT_DIR/lib" ] ||
     error "missing lib directory"
 
-[ -d "$SCRIPT_DIR/bin" ] ||
-    error "missing bin directory"
+[ -f "$SCRIPT_DIR/lib/core.sh" ] ||
+    error "missing lib/core.sh"
+
+[ -f "$SCRIPT_DIR/lib/parser.sh" ] ||
+    error "missing lib/parser.sh"
+
+[ -f "$SCRIPT_DIR/lib/install.sh" ] ||
+    error "missing lib/install.sh"
+
+[ -d "$SCRIPT_DIR/tools" ] ||
+    error "missing tools directory"
+
+[ -f "$SCRIPT_DIR/tools/alias/alias.sh" ] ||
+    error "missing tools/alias/alias.sh"
+
+[ -f "$SCRIPT_DIR/tools/alias/alias.config" ] ||
+    error "missing tools/alias/alias.config"
 
 # ---------------------------------------------------------------------------
 # Shell detection
@@ -228,7 +239,7 @@ add_shell_initialization() {
         *)
             warn "could not determine Bash/Zsh configuration file"
             warn "add this manually to your shell configuration:"
-            warn "source \"${ACT_INIT_FILE}\""
+            warn "export PATH=\"${ACT_BIN_DIR}:\$PATH\""
             return 0
             ;;
     esac
@@ -238,54 +249,161 @@ add_shell_initialization() {
     mkdir -p "$(dirname "$config")"
     touch "$config"
 
+    # ---------------------------------------------------------------
+    # Update an existing act block if one exists.
+    # ---------------------------------------------------------------
+
     if grep -Fq "$ACT_INIT_MARKER_BEGIN" "$config"; then
-        verbose "shell initialization already exists in $config"
+        verbose "act shell initialization already exists in $config"
         return 0
     fi
 
     {
         printf '\n%s\n' "$ACT_INIT_MARKER_BEGIN"
-        printf 'source "%s"\n' "$ACT_INIT_FILE"
+        printf 'export PATH="%s:$PATH"\n' "$ACT_BIN_DIR"
         printf '%s\n' "$ACT_INIT_MARKER_END"
     } >> "$config"
 
     info "updated $config"
 }
 
-remove_shell_initialization() {
-    shell="$(detect_shell)"
-    config="$(detect_shell_config "$shell")"
+# ---------------------------------------------------------------------------
+# Generate `act`
+# ---------------------------------------------------------------------------
+#
+# The generated executable is intentionally tiny.
+#
+# It:
+#   1. loads core
+#   2. loads parser
+#   3. loads aliases
+#   4. loads available actions
+#   5. parses the command
+#   6. dispatches the action
+#
+# The installed script does not contain the actual implementation.
+#
 
-    [ -n "$config" ] || return 0
-    [ -f "$config" ] || return 0
+generate_act_command() {
+    cat > "$ACT_MAIN" <<EOF
+#!/usr/bin/env bash
 
-    grep -Fq "$ACT_INIT_MARKER_BEGIN" "$config" ||
-        return 0
+ACT_LIB_DIR="${ACT_LIB_DIR}"
 
-    awk -v begin="$ACT_INIT_MARKER_BEGIN" \
-        -v end="$ACT_INIT_MARKER_END" '
-        $0 == begin {
-            skip = 1
-            next
-        }
+source "\${ACT_LIB_DIR}/lib/core.sh"
+source "\${ACT_LIB_DIR}/lib/parser.sh"
 
-        $0 == end {
-            skip = 0
-            next
-        }
+# Load all installed action modules that exist.
+for _act_action in "\${ACT_LIB_DIR}/lib/"*.sh; do
+    [ -f "\$_act_action" ] || continue
 
-        !skip {
-            print
-        }
-    ' "$config" > "${config}.act.tmp"
+    case "\$_act_action" in
+        "\${ACT_LIB_DIR}/lib/core.sh")
+            continue
+            ;;
 
-    mv "${config}.act.tmp" "$config"
+        "\${ACT_LIB_DIR}/lib/parser.sh")
+            continue
+            ;;
 
-    info "removed act initialization from $config"
+        *)
+            source "\$_act_action"
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Parser configuration
+# ---------------------------------------------------------------------------
+#
+# The dispatcher knows the actions.
+# Individual actions may add their own flags/subcommands later.
+#
+
+ACT_PARSER_ACTIONS=(
+    install
+)
+
+# Install-specific source selectors.
+ACT_PARSER_SUBCOMMANDS=(
+    pacman
+    aur
+    flatpak
+    web
+)
+
+ACT_PARSER_FLAGS=(
+    -p
+    -a
+    -f
+    -w
+)
+
+act_parse "\$@"
+
+if ! act_parser_require_action; then
+    exit 2
+fi
+
+case "\$ACT_PARSED_ACTION" in
+    install)
+        act_install \
+            "\${ACT_PARSED_SUBCOMMANDS[@]}" \
+            "\${ACT_PARSED_FLAGS[@]}" \
+            "\${ACT_PARSED_ARGS[@]}"
+        ;;
+
+    *)
+        act_error "Unknown action: \$ACT_PARSED_ACTION"
+        exit 2
+        ;;
+esac
+EOF
+
+    chmod +x "$ACT_MAIN"
+
+    verbose "generated $ACT_MAIN"
 }
 
 # ---------------------------------------------------------------------------
-# Installation
+# Generate `install`
+# ---------------------------------------------------------------------------
+#
+# `install` is a convenience executable for the install action.
+#
+# It bypasses action selection and invokes the same runtime implementation.
+#
+# Therefore:
+#
+#   install firefox
+#
+# and:
+#
+#   act install firefox
+#
+# both reach act_install.
+#
+
+generate_install_command() {
+    cat > "$ACT_INSTALL" <<EOF
+#!/usr/bin/env bash
+
+ACT_LIB_DIR="${ACT_LIB_DIR}"
+
+source "\${ACT_LIB_DIR}/lib/core.sh"
+source "\${ACT_LIB_DIR}/lib/parser.sh"
+source "\${ACT_LIB_DIR}/lib/install.sh"
+
+act_install "\$@"
+EOF
+
+    chmod +x "$ACT_INSTALL"
+
+    verbose "generated $ACT_INSTALL"
+}
+
+# ---------------------------------------------------------------------------
+# Install library
 # ---------------------------------------------------------------------------
 
 install_library() {
@@ -298,70 +416,39 @@ install_library() {
     verbose "library: $ACT_LIB_DIR"
     verbose "bin: $ACT_BIN_DIR"
 
-    # Copy the library.
-    cp -R "$SCRIPT_DIR/lib" "$ACT_LIB_DIR/"
-    cp "$SCRIPT_DIR/act.sh" "$ACT_INIT_FILE"
+    # ---------------------------------------------------------------
+    # Library
+    # ---------------------------------------------------------------
 
-    # Copy auxiliary shell/runtime files if present.
+    rm -rf "$ACT_LIB_DIR/lib"
+    cp -R "$SCRIPT_DIR/lib" "$ACT_LIB_DIR/"
+
+    # ---------------------------------------------------------------
+    # Tools
+    # ---------------------------------------------------------------
+
+    rm -rf "$ACT_LIB_DIR/tools"
+    cp -R "$SCRIPT_DIR/tools" "$ACT_LIB_DIR/"
+
+    # ---------------------------------------------------------------
+    # Optional share directory
+    # ---------------------------------------------------------------
+
     if [ -d "$SCRIPT_DIR/share" ]; then
+        rm -rf "$ACT_LIB_DIR/share"
         cp -R "$SCRIPT_DIR/share" "$ACT_LIB_DIR/"
     fi
 
-    # -----------------------------------------------------------------------
-    # `act`
-    #
-    # This is the future dispatcher/entry point.
-    # -----------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Generate public commands
+    # ---------------------------------------------------------------
 
-    if [ -f "$SCRIPT_DIR/bin/act" ]; then
-        cp "$SCRIPT_DIR/bin/act" "$ACT_COMMAND"
-        chmod +x "$ACT_COMMAND"
-    fi
+    generate_act_command
+    generate_install_command
 
-    # -----------------------------------------------------------------------
-    # `install`
-    #
-    # This is the public top-level install action.
-    #
-    # It is deliberately separate from this installer script.
-    # -----------------------------------------------------------------------
-
-    if [ -f "$SCRIPT_DIR/bin/install" ]; then
-        cp "$SCRIPT_DIR/bin/install" "$INSTALL_COMMAND"
-        chmod +x "$INSTALL_COMMAND"
-    fi
-
-    # Make sure the library entry point is readable.
-    chmod 644 "$ACT_INIT_FILE"
-
-    info "installed to $ACT_LIB_DIR"
-}
-
-# ---------------------------------------------------------------------------
-# Uninstallation
-# ---------------------------------------------------------------------------
-
-uninstall_library() {
-    info "uninstalling ${ACT_NAME}"
-
-    if [ -d "$ACT_LIB_DIR" ]; then
-        rm -rf "$ACT_LIB_DIR"
-        info "removed $ACT_LIB_DIR"
-    fi
-
-    if [ -f "$ACT_COMMAND" ]; then
-        rm -f "$ACT_COMMAND"
-        info "removed $ACT_COMMAND"
-    fi
-
-    if [ -f "$INSTALL_COMMAND" ]; then
-        rm -f "$INSTALL_COMMAND"
-        info "removed $INSTALL_COMMAND"
-    fi
-
-    remove_shell_initialization
-
-    info "uninstallation complete"
+    info "installed library to $ACT_LIB_DIR"
+    info "installed act to $ACT_MAIN"
+    info "installed install to $ACT_INSTALL"
 }
 
 # ---------------------------------------------------------------------------
@@ -375,12 +462,17 @@ check_path() {
             ;;
     esac
 
-    warn "${ACT_BIN_DIR} is not in PATH"
+    warn "${ACT_BIN_DIR} is not currently in PATH"
 
     shell="$(detect_shell)"
 
     case "$shell" in
         zsh|bash)
+            warn "restart your shell or run:"
+            warn "source \"$(detect_shell_config "$shell")\""
+            ;;
+
+        *)
             warn "add this to your shell configuration:"
             warn "export PATH=\"${ACT_BIN_DIR}:\$PATH\""
             ;;
@@ -391,34 +483,28 @@ check_path() {
 # Main
 # ---------------------------------------------------------------------------
 
-if [ "$UNINSTALL" -eq 1 ]; then
-    uninstall_library
-    exit 0
-fi
-
 install_library
 add_shell_initialization
 check_path
 
 printf '\n'
+
 info "installation complete"
+
 printf '\n'
 
 cat <<EOF
   Library:
     ${ACT_LIB_DIR}
 
-  Entry point:
-    ${ACT_INIT_FILE}
-
   Commands:
-    ${ACT_COMMAND}
-    ${INSTALL_COMMAND}
+    ${ACT_MAIN}
+    ${ACT_INSTALL}
 
-  Current shell:
-    $(detect_shell)
+  PATH:
+    ${ACT_BIN_DIR}
 
   Try:
-    source "${ACT_INIT_FILE}"
+    source "${ACT_BIN_DIR}/act"
     install --help
 EOF
