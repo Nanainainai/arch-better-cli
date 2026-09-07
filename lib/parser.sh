@@ -5,14 +5,18 @@
 # Generic command-line parser for Bash and Zsh.
 #
 # Responsibilities:
+#   - expand internal act aliases
 #   - identify the action
-#   - recognize action aliases
 #   - recognize configured subcommands
 #   - recognize configured flags
 #   - preserve positional arguments
 #   - handle `--`
 #
-# It does NOT know what pacman, AUR, Flatpak, etc. mean.
+# This parser does NOT:
+#   - execute commands
+#   - expand external aliases
+#   - know about pacman, AUR, Flatpak, etc.
+#   - define action-specific aliases
 #
 
 if [[ -n "${ACT_PARSER_LOADED:-}" ]]; then
@@ -25,6 +29,20 @@ ACT_PARSER_LOADED=1
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+#
+# ACT_PARSER_ACTION
+#   Optional fixed action for parsers that are already operating inside
+#   one action.
+#
+# ACT_PARSER_ACTIONS
+#   List of valid actions when the parser is being used as a dispatcher.
+#
+# ACT_PARSER_FLAGS
+#   Flags understood by the current action/dispatcher.
+#
+# ACT_PARSER_SUBCOMMANDS
+#   Subcommands understood by the current action/dispatcher.
+#
 
 ACT_PARSER_ACTION="${ACT_PARSER_ACTION:-}"
 
@@ -38,6 +56,7 @@ ACT_PARSER_SUBCOMMANDS=()
 # ---------------------------------------------------------------------------
 
 ACT_PARSED_ACTION=""
+
 ACT_PARSED_SUBCOMMANDS=()
 ACT_PARSED_FLAGS=()
 ACT_PARSED_ARGS=()
@@ -72,12 +91,13 @@ act_parser_load_aliases()
 
 
 # ---------------------------------------------------------------------------
-# Reset parser state
+# Reset
 # ---------------------------------------------------------------------------
 
 act_parser_reset()
 {
     ACT_PARSED_ACTION=""
+
     ACT_PARSED_SUBCOMMANDS=()
     ACT_PARSED_FLAGS=()
     ACT_PARSED_ARGS=()
@@ -87,7 +107,7 @@ act_parser_reset()
 
 
 # ---------------------------------------------------------------------------
-# Generic list helper
+# Generic list helpers
 # ---------------------------------------------------------------------------
 
 act_parser_list_contains()
@@ -104,10 +124,6 @@ act_parser_list_contains()
     return 1
 }
 
-
-# ---------------------------------------------------------------------------
-# Configuration checks
-# ---------------------------------------------------------------------------
 
 act_parser_subcommand_allowed()
 {
@@ -140,71 +156,36 @@ act_parser_action_allowed()
 
 
 # ---------------------------------------------------------------------------
-# Alias expansion helpers
+# Internal alias expansion
 # ---------------------------------------------------------------------------
 #
-# Alias config entries are:
+# Internal aliases have this form in alias.config:
 #
-#   alias -> canonical command
+#   i `install` `-i` `ins`
 #
-# The canonical command may contain multiple tokens.
+# Therefore:
 #
-# Example:
+#   -i -> install
+#   ins -> install
 #
-#   paci -> "pacman -S"
+# Only the alias token itself is replaced.
 #
-# Input:
-#
-#   paci firefox
-#
-# becomes:
-#
-#   pacman -S firefox
-#
-# Alias expansion happens once per token and is deliberately non-recursive.
-# This prevents accidental alias loops.
+# External aliases are intentionally NOT handled here.
 #
 
-ACT_PARSER_EXPANDED_ARGS=()
-
-
-act_parser_split_command()
+act_parser_expand_internal_alias()
 {
-    local command="${1:-}"
-
-    # shellcheck disable=SC2206
-    ACT_PARSER_SPLIT_RESULT=($command)
-}
-
-
-act_parser_expand_aliases()
-{
-    local token
+    local token="${1:-}"
     local canonical
-    local expanded=()
 
-    act_parser_load_aliases
-
-    ACT_PARSER_EXPANDED_ARGS=()
-
-    for token in "$@"; do
-
-        if declare -F act_alias_lookup >/dev/null 2>&1 &&
-           canonical="$(act_alias_lookup "$token")"; then
-
-            act_parser_split_command "$canonical"
-
-            expanded+=(
-                "${ACT_PARSER_SPLIT_RESULT[@]}"
-            )
-        else
-            expanded+=("$token")
+    if declare -F act_alias_internal_lookup >/dev/null 2>&1; then
+        if canonical="$(act_alias_internal_lookup "$token")"; then
+            printf '%s\n' "$canonical"
+            return 0
         fi
-    done
+    fi
 
-    ACT_PARSER_EXPANDED_ARGS=(
-        "${expanded[@]}"
-    )
+    printf '%s\n' "$token"
 }
 
 
@@ -215,10 +196,9 @@ act_parser_expand_aliases()
 act_parser_handle_token()
 {
     local token="${1:-}"
-    local action_set=0
 
     # ---------------------------------------------------------------
-    # End of options
+    # Everything after `--` is positional.
     # ---------------------------------------------------------------
 
     if [[ "$ACT_PARSED_END_OF_OPTIONS" -eq 1 ]]; then
@@ -226,17 +206,25 @@ act_parser_handle_token()
         return 0
     fi
 
+
+    # ---------------------------------------------------------------
+    # `--`
+    # ---------------------------------------------------------------
+
     if [[ "$token" == "--" ]]; then
         ACT_PARSED_END_OF_OPTIONS=1
         return 0
     fi
 
+
     # ---------------------------------------------------------------
     # Action
     # ---------------------------------------------------------------
     #
-    # The action is recognized only before the first positional
-    # argument.
+    # If ACT_PARSER_ACTION is configured, the parser expects that
+    # action and does not consume arbitrary tokens as actions.
+    #
+    # Otherwise, an explicitly allowed action can be consumed.
     #
 
     if [[ -z "$ACT_PARSED_ACTION" ]]; then
@@ -254,9 +242,27 @@ act_parser_handle_token()
         fi
     fi
 
+
     # ---------------------------------------------------------------
     # Flags
     # ---------------------------------------------------------------
+    #
+    # Exact flags:
+    #
+    #   -p
+    #   --verbose
+    #
+    # Short clusters:
+    #
+    #   -paf
+    #
+    # become:
+    #
+    #   -p -a -f
+    #
+    # A cluster is accepted only when every character is a configured
+    # short flag.
+    #
 
     if [[ "$token" == -* && "$token" != "-" ]]; then
 
@@ -266,24 +272,17 @@ act_parser_handle_token()
             return 0
         fi
 
-        # Short flag cluster.
-        #
-        # Example:
-        #
-        #   -paf
-        #
-        # becomes:
-        #
-        #   -p -a -f
-        #
 
+        # Short flag cluster.
         if [[ "$token" =~ ^-[^-].+ ]]; then
+
             local cluster="${token#-}"
             local i
             local flag
             local valid=1
 
             for ((i = 0; i < ${#cluster}; i++)); do
+
                 flag="-${cluster:i:1}"
 
                 if ! act_parser_flag_allowed "$flag"; then
@@ -292,7 +291,9 @@ act_parser_handle_token()
                 fi
             done
 
+
             if [[ "$valid" -eq 1 ]]; then
+
                 for ((i = 0; i < ${#cluster}; i++)); do
                     ACT_PARSED_FLAGS+=(
                         "-${cluster:i:1}"
@@ -303,18 +304,31 @@ act_parser_handle_token()
             fi
         fi
 
-        # Unknown options are preserved as arguments rather than
-        # silently discarded.
+
+        # Unknown flags are preserved rather than silently discarded.
         ACT_PARSED_ARGS+=("$token")
         return 0
     fi
+
 
     # ---------------------------------------------------------------
     # Subcommand
     # ---------------------------------------------------------------
     #
-    # Subcommands are recognized only before the first positional
-    # argument.
+    # Subcommands are recognized only while we have not encountered
+    # a positional argument.
+    #
+    # Once an application/positional argument has been encountered:
+    #
+    #   install firefox pacman
+    #
+    # "pacman" is an argument, not a subcommand.
+    #
+    # This allows:
+    #
+    #   install -- pacman
+    #
+    # to explicitly install an application named "pacman".
     #
 
     if [[ "${#ACT_PARSED_ARGS[@]}" -eq 0 ]] &&
@@ -323,6 +337,7 @@ act_parser_handle_token()
         ACT_PARSED_SUBCOMMANDS+=("$token")
         return 0
     fi
+
 
     # ---------------------------------------------------------------
     # Positional argument
@@ -339,13 +354,30 @@ act_parser_handle_token()
 act_parse()
 {
     local token
+    local expanded
 
     act_parser_reset
+    act_parser_load_aliases
 
-    act_parser_expand_aliases "$@"
 
-    for token in "${ACT_PARSER_EXPANDED_ARGS[@]}"; do
-        act_parser_handle_token "$token"
+    for token in "$@"; do
+
+        # Internal aliases are expanded before normal parsing.
+        #
+        # Example:
+        #
+        #   -i firefox
+        #
+        # becomes:
+        #
+        #   install firefox
+        #
+        # External aliases are untouched.
+        expanded="$(
+            act_parser_expand_internal_alias "$token"
+        )"
+
+        act_parser_handle_token "$expanded"
     done
 
     return 0
@@ -399,9 +431,7 @@ act_parser_flag_matches()
     local flag
 
     for flag in "$@"; do
-        if [[ "$flag" == "$wanted" ]]; then
-            return 0
-        fi
+        [[ "$flag" == "$wanted" ]] && return 0
     done
 
     return 1
@@ -416,9 +446,7 @@ act_parser_subcommand_matches()
     local subcommand
 
     for subcommand in "$@"; do
-        if [[ "$subcommand" == "$wanted" ]]; then
-            return 0
-        fi
+        [[ "$subcommand" == "$wanted" ]] && return 0
     done
 
     return 1
@@ -426,21 +454,17 @@ act_parser_subcommand_matches()
 
 
 # ---------------------------------------------------------------------------
-# Normalize subcommands
+# Subcommand normalization
 # ---------------------------------------------------------------------------
 #
-# This function intentionally does nothing by default.
+# No normalization belongs in the generic parser.
 #
-# Action-specific normalization belongs to the action module.
-#
-# For install, lib/install.sh can turn:
+# If an action needs:
 #
 #   -p -> pacman
 #   -a -> aur
-#   -f -> flatpak
-#   -w -> web
 #
-# This keeps parser.sh generic.
+# that action should normalize its own parsed state.
 #
 
 act_parser_normalize_subcommands()
@@ -450,33 +474,44 @@ act_parser_normalize_subcommands()
 
 
 # ---------------------------------------------------------------------------
-# Dump parser state
+# Debug output
 # ---------------------------------------------------------------------------
 
 act_parser_dump()
 {
+    local item
+
     printf 'action: %s\n' \
         "$ACT_PARSED_ACTION"
 
-    printf 'subcommands:'
 
-    local item
+    printf 'subcommands:'
 
     for item in "${ACT_PARSED_SUBCOMMANDS[@]}"; do
         printf ' %s' "$item"
     done
 
-    printf '\nflags:'
+    printf '\n'
+
+
+    printf 'flags:'
 
     for item in "${ACT_PARSED_FLAGS[@]}"; do
         printf ' %s' "$item"
     done
 
-    printf '\nargs:'
+    printf '\n'
+
+
+    printf 'args:'
 
     for item in "${ACT_PARSED_ARGS[@]}"; do
         printf ' %s' "$item"
     done
 
     printf '\n'
+
+
+    printf 'end_of_options: %s\n' \
+        "$ACT_PARSED_END_OF_OPTIONS"
 }
