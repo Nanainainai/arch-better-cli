@@ -1,3 +1,4 @@
+```bash
 #!/usr/bin/env bash
 
 # act/install.sh
@@ -271,17 +272,31 @@ add_shell_initialization() {
 # Generate `act`
 # ---------------------------------------------------------------------------
 #
-# The generated executable is intentionally tiny.
+# The generated executable is intentionally small.
 #
 # It:
 #   1. loads core
 #   2. loads parser
 #   3. loads aliases
 #   4. loads available actions
-#   5. parses the command
-#   6. dispatches the action
+#   5. identifies the action
+#   6. dispatches the action with the original ordered arguments
 #
-# The installed script does not contain the actual implementation.
+# IMPORTANT:
+#
+# The dispatcher must NOT reconstruct the arguments from:
+#
+#   ACT_PARSED_SUBCOMMANDS
+#   ACT_PARSED_FLAGS
+#   ACT_PARSED_ARGS
+#
+# Doing so changes argument ordering and breaks action-specific syntax
+# such as:
+#
+#   install -p -a firefox -f spotify
+#
+# Instead, the dispatcher identifies the action and then passes the original
+# arguments after that action directly to the action implementation.
 #
 
 generate_act_command() {
@@ -291,6 +306,7 @@ generate_act_command() {
 ACT_LIB_DIR="${ACT_LIB_DIR}"
 
 source "\${ACT_LIB_DIR}/lib/core.sh"
+source "\${ACT_LIB_DIR}/tools/alias/alias.sh"
 source "\${ACT_LIB_DIR}/lib/parser.sh"
 
 # Load all installed action modules that exist.
@@ -316,28 +332,52 @@ done
 # Parser configuration
 # ---------------------------------------------------------------------------
 #
-# The dispatcher knows the actions.
-# Individual actions may add their own flags/subcommands later.
+# The generic parser only needs to know about actions here.
+#
+# Install-specific source selectors such as:
+#
+#   pacman
+#   aur
+#   flatpak
+#   web
+#   -p
+#   -a
+#   -f
+#   -w
+#
+# are interpreted by lib/install.sh.
+#
+# Keeping them out of the generic parser prevents install-specific syntax
+# from becoming global act syntax.
 #
 
 ACT_PARSER_ACTIONS=(
     install
 )
 
-# Install-specific source selectors.
-ACT_PARSER_SUBCOMMANDS=(
-    pacman
-    aur
-    flatpak
-    web
-)
+# ---------------------------------------------------------------------------
+# Preserve the original argv.
+# ---------------------------------------------------------------------------
+#
+# The action parser may inspect the arguments, but action-specific modules
+# need the original ordering.
+#
+# Example:
+#
+#   act install -p -a firefox -f spotify
+#
+# must reach act_install as:
+#
+#   -p -a firefox -f spotify
+#
+# and NOT as:
+#
+#   pacman aur flatpak firefox spotify
+#
+# because install source selectors are scoped by their position.
+#
 
-ACT_PARSER_FLAGS=(
-    -p
-    -a
-    -f
-    -w
-)
+_act_original_args=( "\$@" )
 
 act_parse "\$@"
 
@@ -347,10 +387,13 @@ fi
 
 case "\$ACT_PARSED_ACTION" in
     install)
-        act_install \
-            "\${ACT_PARSED_SUBCOMMANDS[@]}" \
-            "\${ACT_PARSED_FLAGS[@]}" \
-            "\${ACT_PARSED_ARGS[@]}"
+        # Remove the action from the original argv.
+        # Everything after it is passed unchanged to act_install.
+        if [ "\${#_act_original_args[@]}" -gt 0 ]; then
+            _act_original_args=( "\${_act_original_args[@]:1}" )
+        fi
+
+        act_install "\${_act_original_args[@]}"
         ;;
 
     *)
@@ -383,6 +426,7 @@ EOF
 #
 # both reach act_install.
 #
+# The arguments are passed unchanged.
 
 generate_install_command() {
     cat > "$ACT_INSTALL" <<EOF
@@ -391,6 +435,7 @@ generate_install_command() {
 ACT_LIB_DIR="${ACT_LIB_DIR}"
 
 source "\${ACT_LIB_DIR}/lib/core.sh"
+source "\${ACT_LIB_DIR}/tools/alias/alias.sh"
 source "\${ACT_LIB_DIR}/lib/parser.sh"
 source "\${ACT_LIB_DIR}/lib/install.sh"
 
@@ -505,6 +550,8 @@ cat <<EOF
     ${ACT_BIN_DIR}
 
   Try:
-    source "${ACT_BIN_DIR}/act"
+    act --help
     install --help
+    act install --help
 EOF
+```
