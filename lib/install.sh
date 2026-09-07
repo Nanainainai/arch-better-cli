@@ -12,9 +12,22 @@
 #   install -p -a firefox -f spotify
 #   install pacman aur firefox
 #   install pacman aur firefox flatpak spotify
+#   install -w firefox
+#   install --dry-run firefox
 #   install -- pacman
 #
 # Source selectors apply to the following application only.
+#
+# Source integrations are adapters. They may provide functions such as:
+#
+#   act_source_pacman_resolve
+#   act_source_aur_resolve
+#   act_source_flatpak_resolve
+#   act_source_web_resolve
+#
+# Those adapters invoke the actual external commands, such as pacman,
+# an AUR helper, or flatpak. Those external programs are not libraries
+# loaded by act.
 #
 
 if [[ -n "${ACT_INSTALL_LOADED:-}" ]]; then
@@ -47,17 +60,28 @@ ACT_INSTALL_SOURCE_ALIASES=(
 
 
 # ---------------------------------------------------------------------------
-# Internal state
+# Runtime state
 # ---------------------------------------------------------------------------
 
 ACT_INSTALL_APPS=()
 ACT_INSTALL_APP_SOURCES=()
-ACT_INSTALL_PLANS=()
 
 ACT_INSTALL_CURRENT_SOURCES=()
-ACT_INSTALL_CURRENT_APP=""
+ACT_INSTALL_RESOLVED_SOURCES=()
 
-ACT_INSTALL_HAS_EXPLICIT_SOURCES=0
+ACT_INSTALL_PLAN_REQUESTED=()
+ACT_INSTALL_PLAN_SOURCE=()
+ACT_INSTALL_PLAN_IDENTIFIER=()
+
+ACT_INSTALL_FZF_RESULTS=()
+ACT_INSTALL_FZF_SOURCE=""
+ACT_INSTALL_FZF_IDENTIFIER=""
+
+# Action-local option.
+#
+# This is deliberately reset by act_install() on every invocation so that
+# calling act_install more than once in the same shell cannot leak state.
+ACT_DRY_RUN=0
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +91,6 @@ ACT_INSTALL_HAS_EXPLICIT_SOURCES=0
 act_install_is_source()
 {
     local token="${1:-}"
-    local source
 
     case "$token" in
         pacman|-p)
@@ -133,6 +156,8 @@ act_install_add_source()
     if ! act_install_source_contains "$source"; then
         ACT_INSTALL_CURRENT_SOURCES+=("$source")
     fi
+
+    return 0
 }
 
 
@@ -148,23 +173,28 @@ act_install_default_sources()
 # App/source specification parser
 # ---------------------------------------------------------------------------
 #
-# This parser is deliberately install-specific.
-#
-# A source selector applies to the NEXT positional application.
+# A source selector applies to the NEXT application.
 #
 # Example:
 #
-#   -p -a firefox -f spotify
+#   install -p -a firefox -f spotify
 #
 # produces:
 #
-#   firefox: pacman aur
-#   spotify: flatpak
+#   firefox -> pacman aur
+#   spotify -> flatpak
 #
-# Once an application has been encountered, its source set is finalized and
-# the next source selector starts a new source set.
+# Once an application is encountered, its source set is finalized.
 #
-# `--` makes everything following it an application, with no source parsing.
+# Action options:
+#
+#   -n
+#   --dry-run
+#
+# are global to this invocation and may appear anywhere before `--`.
+#
+# `--` ends option/source parsing. Everything after it is an application
+# name, including strings such as `-p` or `--dry-run`.
 #
 
 act_install_parse_args()
@@ -175,93 +205,61 @@ act_install_parse_args()
 
     ACT_INSTALL_APPS=()
     ACT_INSTALL_APP_SOURCES=()
-
     ACT_INSTALL_CURRENT_SOURCES=()
-    ACT_INSTALL_HAS_EXPLICIT_SOURCES=0
 
     for token in "$@"; do
 
         # ---------------------------------------------------------------
-        # End of options
+        # Everything after `--` is an application.
         # ---------------------------------------------------------------
 
         if [[ "$end_of_options" -eq 1 ]]; then
             ACT_INSTALL_APPS+=("$token")
+
             ACT_INSTALL_APP_SOURCES+=(
                 "$(printf '%s\n' "${ACT_INSTALL_CURRENT_SOURCES[*]:-}")"
             )
 
             ACT_INSTALL_CURRENT_SOURCES=()
-            ACT_INSTALL_HAS_EXPLICIT_SOURCES=0
-            continue
-        fi
-
-        if [[ "$token" == "--" ]]; then
-            end_of_options=1
-
-            # If no source was explicitly selected, use default behavior.
-            if [[ "${#ACT_INSTALL_CURRENT_SOURCES[@]}" -eq 0 ]]; then
-                act_install_default_sources
-            fi
-
             continue
         fi
 
         # ---------------------------------------------------------------
-        # Source selector
+        # End of options.
+        # ---------------------------------------------------------------
+
+        if [[ "$token" == "--" ]]; then
+            end_of_options=1
+
+            # A pending source selection belongs to the next application.
+            # If none was selected, that application uses the defaults.
+            continue
+        fi
+
+        # ---------------------------------------------------------------
+        # Action options.
+        # ---------------------------------------------------------------
+
+        case "$token" in
+            -n|--dry-run)
+                ACT_DRY_RUN=1
+                continue
+                ;;
+        esac
+
+        # ---------------------------------------------------------------
+        # Source selector.
         # ---------------------------------------------------------------
 
         if act_install_is_source "$token"; then
             source="$(act_install_normalize_source "$token")"
 
-            # A source appearing after an app starts the source selection
-            # for the NEXT app.
-            #
-            # Therefore:
-            #
-            #   -p firefox -f spotify
-            #
-            # means:
-            #
-            #   firefox -> pacman
-            #   spotify -> flatpak
-            #
-            # If sources have already been selected but no app has been
-            # seen yet, they accumulate:
-            #
-            #   -p -a firefox
-            #
-            # means:
-            #
-            #   firefox -> pacman + aur
-            if [[ "${#ACT_INSTALL_CURRENT_SOURCES[@]}" -eq 0 ]]; then
-                act_install_add_source "$source"
-                ACT_INSTALL_HAS_EXPLICIT_SOURCES=1
-                continue
-            fi
-
-            # If we already have sources selected, they still belong to
-            # the next app.
-            #
-            # This gives:
-            #
-            #   -p -a firefox
-            #
-            # -> pacman + aur.
-            #
-            # However, after an app is finalized the source list is empty,
-            # so:
-            #
-            #   firefox -f spotify
-            #
-            # -> firefox gets defaults, spotify gets flatpak.
             act_install_add_source "$source"
-            ACT_INSTALL_HAS_EXPLICIT_SOURCES=1
             continue
         fi
 
         # ---------------------------------------------------------------
-        # Application
+        # Application.
         # ---------------------------------------------------------------
 
         ACT_INSTALL_APPS+=("$token")
@@ -274,9 +272,8 @@ act_install_parse_args()
             "$(printf '%s\n' "${ACT_INSTALL_CURRENT_SOURCES[*]}")"
         )
 
-        # Source selectors do not carry over to the next app.
+        # Source selectors do not carry over to the next application.
         ACT_INSTALL_CURRENT_SOURCES=()
-        ACT_INSTALL_HAS_EXPLICIT_SOURCES=0
     done
 
     return 0
@@ -287,15 +284,10 @@ act_install_parse_args()
 # Source list reconstruction
 # ---------------------------------------------------------------------------
 #
-# Bash and Zsh both support arrays, but storing an array inside another array
-# is deliberately avoided here. Each app's source list is stored as a
-# space-separated string.
+# Each application's source list is stored as a space-separated string.
 #
-# `act_install_get_app_sources` expands one of those lists into the global
-# ACT_INSTALL_RESOLVED_SOURCES array.
+# This avoids nested arrays while keeping the public runtime state simple.
 #
-
-ACT_INSTALL_RESOLVED_SOURCES=()
 
 act_install_get_app_sources()
 {
@@ -307,7 +299,6 @@ act_install_get_app_sources()
     source_string="${ACT_INSTALL_APP_SOURCES[$index]:-}"
 
     if [[ -z "$source_string" ]]; then
-        act_install_default_sources
         ACT_INSTALL_RESOLVED_SOURCES=(
             "${ACT_INSTALL_SOURCES[@]}"
         )
@@ -316,6 +307,8 @@ act_install_get_app_sources()
 
     # shellcheck disable=SC2206
     ACT_INSTALL_RESOLVED_SOURCES=($source_string)
+
+    return 0
 }
 
 
@@ -323,9 +316,11 @@ act_install_get_app_sources()
 # Plan representation
 # ---------------------------------------------------------------------------
 #
-# Each plan entry is:
+# Every plan entry consists of:
 #
-#   requested_name|source|actual_identifier
+#   requested name
+#   source
+#   actual installation identifier
 #
 # Examples:
 #
@@ -333,14 +328,6 @@ act_install_get_app_sources()
 #   spotify|aur|spotify
 #   spotify|flatpak|com.spotify.Client
 #
-# The third field is intentionally separate from the requested name because
-# Flatpak and other sources may use a different installation identifier.
-#
-
-ACT_INSTALL_PLAN_REQUESTED=()
-ACT_INSTALL_PLAN_SOURCE=()
-ACT_INSTALL_PLAN_IDENTIFIER=()
-
 
 act_install_clear_plan()
 {
@@ -356,13 +343,15 @@ act_install_add_plan()
     local source="${2:-}"
     local identifier="${3:-}"
 
-    [[ -z "$requested" ]] && return 1
-    [[ -z "$source" ]] && return 1
-    [[ -z "$identifier" ]] && return 1
+    [[ -n "$requested" ]] || return 1
+    [[ -n "$source" ]] || return 1
+    [[ -n "$identifier" ]] || return 1
 
     ACT_INSTALL_PLAN_REQUESTED+=("$requested")
     ACT_INSTALL_PLAN_SOURCE+=("$source")
     ACT_INSTALL_PLAN_IDENTIFIER+=("$identifier")
+
+    return 0
 }
 
 
@@ -370,35 +359,39 @@ act_install_add_plan()
 # Source resolver interface
 # ---------------------------------------------------------------------------
 #
-# Each source module should eventually provide:
+# Integrations may provide:
 #
 #   act_source_pacman_resolve APP
 #   act_source_aur_resolve APP
 #   act_source_flatpak_resolve APP
 #   act_source_web_resolve APP
 #
-# The resolver prints the actual identifier on stdout and returns:
+# Return values:
 #
-#   0 = found
-#   1 = not found
-#   other = resolver error
+#   0 = found, identifier printed to stdout
+#   1 = not found / integration unavailable
+#   other = actual integration error
 #
-# This keeps install.sh independent from the implementation of each source.
+# Missing integrations are not fatal during automatic resolution. This is
+# important because the default resolver should be able to continue from
+# pacman -> AUR -> Flatpak -> fzf -> web.
 #
-
 
 act_install_source_resolve()
 {
     local source="${1:-}"
     local app="${2:-}"
 
+    [[ -n "$source" ]] || return 2
+    [[ -n "$app" ]] || return 2
+
     case "$source" in
         pacman)
             if declare -F act_source_pacman_resolve >/dev/null 2>&1; then
                 act_source_pacman_resolve "$app"
             else
-                act_error "pacman source module is not loaded."
-                return 2
+                act_debug "pacman integration is unavailable."
+                return 1
             fi
             ;;
 
@@ -406,8 +399,8 @@ act_install_source_resolve()
             if declare -F act_source_aur_resolve >/dev/null 2>&1; then
                 act_source_aur_resolve "$app"
             else
-                act_error "AUR source module is not loaded."
-                return 2
+                act_debug "AUR integration is unavailable."
+                return 1
             fi
             ;;
 
@@ -415,8 +408,8 @@ act_install_source_resolve()
             if declare -F act_source_flatpak_resolve >/dev/null 2>&1; then
                 act_source_flatpak_resolve "$app"
             else
-                act_error "Flatpak source module is not loaded."
-                return 2
+                act_debug "Flatpak integration is unavailable."
+                return 1
             fi
             ;;
 
@@ -424,8 +417,8 @@ act_install_source_resolve()
             if declare -F act_source_web_resolve >/dev/null 2>&1; then
                 act_source_web_resolve "$app"
             else
-                act_error "web source module is not loaded."
-                return 2
+                act_debug "web integration is unavailable."
+                return 1
             fi
             ;;
 
@@ -441,10 +434,10 @@ act_install_source_resolve()
 # Automatic package resolution
 # ---------------------------------------------------------------------------
 #
-# Try each permitted package source in order.
+# Web is deliberately excluded here.
 #
-# Web is deliberately NOT part of automatic package resolution unless the
-# user explicitly selected -w/web.
+# If a source integration is unavailable, resolution continues with the next
+# source.
 #
 
 act_install_resolve_automatic()
@@ -452,19 +445,20 @@ act_install_resolve_automatic()
     local app="${1:-}"
     local source
     local identifier
+    local status
 
-    [[ -z "$app" ]] && return 1
+    [[ -n "$app" ]] || return 1
 
     for source in "${ACT_INSTALL_RESOLVED_SOURCES[@]}"; do
 
-        # Explicit web selection is handled separately.
         [[ "$source" == "web" ]] && continue
 
         identifier="$(
             act_install_source_resolve "$source" "$app"
         )"
+        status=$?
 
-        case "$?" in
+        case "$status" in
             0)
                 if [[ -n "$identifier" ]]; then
                     act_install_add_plan \
@@ -477,10 +471,14 @@ act_install_resolve_automatic()
 
                     return 0
                 fi
+
+                act_debug \
+                    "source '$source' returned no identifier for '$app'."
                 ;;
 
             1)
-                # Not found in this source. Continue.
+                act_debug \
+                    "no '$app' match through $source."
                 ;;
 
             *)
@@ -500,20 +498,18 @@ act_install_resolve_automatic()
 # Combined fzf resolution
 # ---------------------------------------------------------------------------
 #
-# The source modules may provide:
+# Search adapters may provide:
 #
 #   act_source_pacman_search APP
 #   act_source_aur_search APP
 #   act_source_flatpak_search APP
 #
-# Each function should print records in the form:
+# Each prints:
 #
 #   source<TAB>identifier<TAB>display-name
 #
-# install.sh combines ALL permitted sources into one fzf invocation.
+# All candidates for the current application are combined into one fzf menu.
 #
-
-ACT_INSTALL_FZF_RESULTS=()
 
 act_install_collect_fzf_results()
 {
@@ -524,7 +520,6 @@ act_install_collect_fzf_results()
     ACT_INSTALL_FZF_RESULTS=()
 
     for source in "${ACT_INSTALL_RESOLVED_SOURCES[@]}"; do
-
         case "$source" in
             pacman)
                 if declare -F act_source_pacman_search >/dev/null 2>&1; then
@@ -560,10 +555,16 @@ act_install_collect_fzf_results()
                 ;;
 
             web)
-                # Web is intentionally excluded from package fzf.
+                # Web does not participate in package fzf.
+                ;;
+
+            *)
+                act_debug "Skipping unknown fzf source '$source'."
                 ;;
         esac
     done
+
+    return 0
 }
 
 
@@ -571,7 +572,7 @@ act_install_fzf_select()
 {
     local selection
 
-    [[ "${#ACT_INSTALL_FZF_RESULTS[@]}" -eq 0 ]] && return 1
+    [[ "${#ACT_INSTALL_FZF_RESULTS[@]}" -gt 0 ]] || return 1
 
     if ! act_has_command fzf; then
         act_debug "fzf is not installed."
@@ -587,7 +588,7 @@ act_install_fzf_select()
                 --prompt="Install > "
     )"
 
-    [[ -z "$selection" ]] && return 1
+    [[ -n "$selection" ]] || return 1
 
     printf '%s\n' "$selection"
 }
@@ -596,26 +597,32 @@ act_install_fzf_select()
 # ---------------------------------------------------------------------------
 # Fzf result parsing
 # ---------------------------------------------------------------------------
-#
-# Expected format:
-#
-#   source<TAB>identifier<TAB>display-name
-#
-# Example:
-#
-#   flatpak<TAB>com.spotify.Client<TAB>Spotify
-#
 
 act_install_parse_fzf_result()
 {
     local result="${1:-}"
     local source
     local identifier
+    local display_name
 
-    IFS=$'\t' read -r source identifier _ <<< "$result"
+    ACT_INSTALL_FZF_SOURCE=""
+    ACT_INSTALL_FZF_IDENTIFIER=""
 
-    [[ -z "$source" ]] && return 1
-    [[ -z "$identifier" ]] && return 1
+    [[ -n "$result" ]] || return 1
+
+    IFS=$'\t' read -r source identifier display_name <<< "$result"
+
+    [[ -n "$source" ]] || return 1
+    [[ -n "$identifier" ]] || return 1
+
+    case "$source" in
+        pacman|aur|flatpak)
+            ;;
+        *)
+            act_debug "Invalid fzf source '$source'."
+            return 1
+            ;;
+    esac
 
     ACT_INSTALL_FZF_SOURCE="$source"
     ACT_INSTALL_FZF_IDENTIFIER="$identifier"
@@ -633,6 +640,8 @@ act_install_resolve_fzf()
     local app="${1:-}"
     local selection
 
+    [[ -n "$app" ]] || return 1
+
     act_install_collect_fzf_results "$app"
 
     if [[ "${#ACT_INSTALL_FZF_RESULTS[@]}" -eq 0 ]]; then
@@ -642,7 +651,7 @@ act_install_resolve_fzf()
 
     selection="$(act_install_fzf_select)"
 
-    [[ -z "$selection" ]] && return 1
+    [[ -n "$selection" ]] || return 1
 
     if ! act_install_parse_fzf_result "$selection"; then
         act_error "Invalid fzf selection."
@@ -662,28 +671,33 @@ act_install_resolve_fzf()
 
 
 # ---------------------------------------------------------------------------
-# Web fallback
+# Web resolution
 # ---------------------------------------------------------------------------
 
 act_install_resolve_web()
 {
     local app="${1:-}"
     local identifier
+    local status
 
-    [[ -z "$app" ]] && return 1
+    [[ -n "$app" ]] || return 1
 
     if ! declare -F act_source_web_resolve >/dev/null 2>&1; then
-        act_error "web source module is not loaded."
-        return 2
+        act_debug "web integration is unavailable."
+        return 1
     fi
 
     identifier="$(
         act_source_web_resolve "$app"
     )"
+    status=$?
 
-    case "$?" in
+    case "$status" in
         0)
-            [[ -z "$identifier" ]] && return 1
+            if [[ -z "$identifier" ]]; then
+                act_debug "web integration returned no identifier for '$app'."
+                return 1
+            fi
 
             act_install_add_plan \
                 "$app" \
@@ -712,11 +726,11 @@ act_install_resolve_app()
 {
     local index="${1:-}"
     local app
-    local source
+    local web_only=0
 
     app="${ACT_INSTALL_APPS[$index]:-}"
 
-    [[ -z "$app" ]] && return 1
+    [[ -n "$app" ]] || return 1
 
     act_install_get_app_sources "$index"
 
@@ -729,6 +743,8 @@ act_install_resolve_app()
 
     if [[ "${#ACT_INSTALL_RESOLVED_SOURCES[@]}" -eq 1 ]] &&
        [[ "${ACT_INSTALL_RESOLVED_SOURCES[0]}" == "web" ]]; then
+
+        web_only=1
 
         act_info "Searching the web for '$app'..."
 
@@ -752,14 +768,7 @@ act_install_resolve_app()
     # Combined fzf search
     # ---------------------------------------------------------------
     #
-    # Only package sources selected for THIS application participate.
-    #
-    # Example:
-    #
-    #   -p -a firefox -f spotify
-    #
-    # firefox's fzf contains pacman + AUR.
-    # spotify's fzf contains flatpak only.
+    # Only the package sources selected for THIS application participate.
     #
 
     act_info "No direct package match for '$app'."
@@ -776,6 +785,10 @@ act_install_resolve_app()
 
     if act_install_resolve_web "$app"; then
         return 0
+    fi
+
+    if [[ "$web_only" -eq 0 ]]; then
+        act_debug "Web fallback was unavailable or found no result for '$app'."
     fi
 
     act_error "Could not resolve '$app'."
@@ -817,7 +830,10 @@ act_install_show_plan()
 {
     local index
 
-    [[ "${#ACT_INSTALL_PLAN_REQUESTED[@]}" -eq 0 ]] && return 1
+    if [[ "${#ACT_INSTALL_PLAN_REQUESTED[@]}" -eq 0 ]]; then
+        act_info "Install plan is empty."
+        return 1
+    fi
 
     act_info "Install plan:"
 
@@ -827,6 +843,8 @@ act_install_show_plan()
             "${ACT_INSTALL_PLAN_SOURCE[$index]}" \
             "${ACT_INSTALL_PLAN_IDENTIFIER[$index]}"
     done
+
+    return 0
 }
 
 
@@ -834,32 +852,28 @@ act_install_show_plan()
 # Source installer interface
 # ---------------------------------------------------------------------------
 #
-# Source modules provide:
+# Integrations may provide:
 #
 #   act_source_pacman_install ID...
 #   act_source_aur_install ID...
 #   act_source_flatpak_install ID...
 #   act_source_web_install ID...
 #
-# Multiple packages are grouped by source so that:
-#
-#   firefox -> pacman
-#   vlc     -> pacman
-#
-# results in one pacman invocation rather than two.
+# These adapters invoke the real external package managers/tools.
 #
 
 act_install_execute_source()
 {
     local source="${1:-}"
-    shift
+
+    shift || true
 
     case "$source" in
         pacman)
             if declare -F act_source_pacman_install >/dev/null 2>&1; then
                 act_source_pacman_install "$@"
             else
-                act_error "pacman installer module is not loaded."
+                act_error "pacman integration is unavailable."
                 return 2
             fi
             ;;
@@ -868,7 +882,7 @@ act_install_execute_source()
             if declare -F act_source_aur_install >/dev/null 2>&1; then
                 act_source_aur_install "$@"
             else
-                act_error "AUR installer module is not loaded."
+                act_error "AUR integration is unavailable."
                 return 2
             fi
             ;;
@@ -877,7 +891,7 @@ act_install_execute_source()
             if declare -F act_source_flatpak_install >/dev/null 2>&1; then
                 act_source_flatpak_install "$@"
             else
-                act_error "Flatpak installer module is not loaded."
+                act_error "Flatpak integration is unavailable."
                 return 2
             fi
             ;;
@@ -886,7 +900,7 @@ act_install_execute_source()
             if declare -F act_source_web_install >/dev/null 2>&1; then
                 act_source_web_install "$@"
             else
-                act_error "web installer module is not loaded."
+                act_error "web integration is unavailable."
                 return 2
             fi
             ;;
@@ -941,21 +955,23 @@ act_install_execute_plan()
                 ;;
 
             *)
-                act_error \
-                    "Invalid install plan source: $source"
+                act_error "Invalid install plan source: $source"
                 return 2
                 ;;
         esac
     done
 
     # ---------------------------------------------------------------
-    # Show plan
+    # Always show the complete plan before doing anything.
     # ---------------------------------------------------------------
 
     act_install_show_plan
 
     # ---------------------------------------------------------------
-    # Dry run
+    # Dry run.
+    #
+    # Resolution still happens so the displayed plan is meaningful.
+    # Nothing is passed to an installer.
     # ---------------------------------------------------------------
 
     if [[ "${ACT_DRY_RUN:-0}" -eq 1 ]]; then
@@ -964,11 +980,12 @@ act_install_execute_plan()
     fi
 
     # ---------------------------------------------------------------
-    # Execute grouped package-manager operations
+    # Execute grouped package-manager operations.
     # ---------------------------------------------------------------
 
     if [[ "${#pacman_packages[@]}" -gt 0 ]]; then
-        act_info "Installing ${#pacman_packages[@]} package(s) with pacman..."
+        act_info \
+            "Installing ${#pacman_packages[@]} package(s) with pacman..."
 
         if ! act_install_execute_source \
             pacman \
@@ -980,7 +997,8 @@ act_install_execute_plan()
     fi
 
     if [[ "${#aur_packages[@]}" -gt 0 ]]; then
-        act_info "Installing ${#aur_packages[@]} AUR package(s)..."
+        act_info \
+            "Installing ${#aur_packages[@]} AUR package(s)..."
 
         if ! act_install_execute_source \
             aur \
@@ -992,7 +1010,8 @@ act_install_execute_plan()
     fi
 
     if [[ "${#flatpak_packages[@]}" -gt 0 ]]; then
-        act_info "Installing ${#flatpak_packages[@]} Flatpak package(s)..."
+        act_info \
+            "Installing ${#flatpak_packages[@]} Flatpak package(s)..."
 
         if ! act_install_execute_source \
             flatpak \
@@ -1004,7 +1023,8 @@ act_install_execute_plan()
     fi
 
     if [[ "${#web_packages[@]}" -gt 0 ]]; then
-        act_info "Installing ${#web_packages[@]} web result(s)..."
+        act_info \
+            "Installing ${#web_packages[@]} web result(s)..."
 
         if ! act_install_execute_source \
             web \
@@ -1027,8 +1047,12 @@ act_install_usage()
 {
     cat <<'EOF'
 Usage:
-  install [sources] APP...
-  install APP... [sources] APP...
+  install [options] [sources] APP...
+  install [options] APP... [sources] APP...
+
+Options:
+  -n, --dry-run    Resolve and show the install plan without installing
+  -h, --help       Show this help
 
 Sources:
   pacman, -p       Use Arch official repositories
@@ -1047,6 +1071,9 @@ Examples:
 
   install -w firefox
 
+  install --dry-run firefox
+  install -n -p firefox
+
   install -- pacman
 
 Default behavior:
@@ -1061,6 +1088,13 @@ Examples:
   Means:
     firefox -> pacman + AUR
     spotify -> Flatpak
+
+The `--` marker ends source and option parsing.
+
+For example:
+  install -- pacman
+
+installs the application named "pacman".
 EOF
 }
 
@@ -1071,19 +1105,37 @@ EOF
 
 act_install()
 {
-    local arg="${1:-}"
-
     # ---------------------------------------------------------------
-    # Help
+    # Reset invocation-local state.
     # ---------------------------------------------------------------
 
-    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+    ACT_DRY_RUN=0
+
+    ACT_INSTALL_APPS=()
+    ACT_INSTALL_APP_SOURCES=()
+    ACT_INSTALL_CURRENT_SOURCES=()
+    ACT_INSTALL_RESOLVED_SOURCES=()
+
+    ACT_INSTALL_FZF_RESULTS=()
+    ACT_INSTALL_FZF_SOURCE=""
+    ACT_INSTALL_FZF_IDENTIFIER=""
+
+    act_install_clear_plan
+
+    # ---------------------------------------------------------------
+    # Help.
+    #
+    # Only treat -h/--help as action help when it is the first argument.
+    # After `--`, it is allowed to be an application name.
+    # ---------------------------------------------------------------
+
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         act_install_usage
         return 0
     fi
 
     # ---------------------------------------------------------------
-    # Parse
+    # Parse.
     # ---------------------------------------------------------------
 
     act_install_parse_args "$@"
@@ -1112,6 +1164,11 @@ act_install()
         return 1
     fi
 
-    act_success "Installation complete."
+    if [[ "${ACT_DRY_RUN:-0}" -eq 1 ]]; then
+        act_success "Dry run complete."
+    else
+        act_success "Installation complete."
+    fi
+
     return 0
 }
