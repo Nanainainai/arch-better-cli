@@ -2,10 +2,17 @@
 #
 # act/tools/alias/alias.sh
 #
-# Parser-side command alias definitions.
+# Alias configuration for the act parser.
 #
-# This file does NOT create shell aliases.
-# It only loads alias.config and provides alias information to parser.sh.
+# Types:
+#
+#   i = internal act/action alias
+#   e = external command alias
+#
+# Example:
+#
+#   i `install` `-i` `ins`
+#   e `pacman -S` `paci`
 #
 
 if [[ -n "${ACT_ALIAS_LOADED:-}" ]]; then
@@ -26,24 +33,21 @@ ACT_ALIAS_CONFIG="${ACT_ALIAS_CONFIG:-}"
 # Alias storage
 # ---------------------------------------------------------------------------
 #
-# Each entry is stored as:
+# Internal aliases:
 #
-#   alias<TAB>canonical command
+#   alias<TAB>canonical
 #
-# Example:
+# External aliases:
 #
-#   -i<TAB>install
-#   ins<TAB>install
-#   paci<TAB>pacman -S
-#
-# This keeps the parser independent of the actual config-file syntax.
+#   alias<TAB>canonical
 #
 
-ACT_ALIASES=()
+ACT_INTERNAL_ALIASES=()
+ACT_EXTERNAL_ALIASES=()
 
 
 # ---------------------------------------------------------------------------
-# Determine config path
+# Locate configuration
 # ---------------------------------------------------------------------------
 
 act_alias_default_config()
@@ -52,7 +56,8 @@ act_alias_default_config()
 
     library_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-    printf '%s\n' "$library_root/tools/alias/alias.config"
+    printf '%s\n' \
+        "$library_root/tools/alias/alias.config"
 }
 
 
@@ -67,83 +72,78 @@ act_alias_config_path()
 
 
 # ---------------------------------------------------------------------------
-# String helpers
+# Parse one config line
 # ---------------------------------------------------------------------------
-
-act_alias_trim()
-{
-    local value="${1:-}"
-
-    # Remove leading whitespace.
-    value="${value#"${value%%[![:space:]]*}"}"
-
-    # Remove trailing whitespace.
-    value="${value%"${value##*[![:space:]]}"}"
-
-    printf '%s\n' "$value"
-}
-
-
-# ---------------------------------------------------------------------------
-# Parse one backtick-delimited config line
-# ---------------------------------------------------------------------------
-#
-# Input:
-#
-#   `install` `-i` `ins`
-#
-# Output:
-#
-#   install
-#   -i
-#   ins
-#
-# The first field is the canonical command.
-# Every remaining field is an alias.
-#
 
 act_alias_parse_line()
 {
     local line="${1:-}"
+    local type
     local rest
     local field
     local fields=()
+    local canonical
+    local alias
 
-    # Ignore comments and empty lines.
-    [[ -z "$line" ]] && return 0
+    # Ignore blank lines.
+    [[ -z "${line//[[:space:]]/}" ]] && return 0
+
+    # Ignore comments.
     [[ "$line" == \#* ]] && return 0
 
-    rest="$line"
+    # First character identifies alias type.
+    type="${line:0:1}"
+
+    case "$type" in
+        i|e)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    rest="${line:1}"
 
     while [[ "$rest" =~ ^[[:space:]]*\`([^\`]*)\`(.*)$ ]]; do
         field="${BASH_REMATCH[1]}"
         rest="${BASH_REMATCH[2]}"
 
-        field="$(act_alias_trim "$field")"
+        # Trim whitespace inside the backticks.
+        field="${field#"${field%%[![:space:]]*}"}"
+        field="${field%"${field##*[![:space:]]}"}"
 
         [[ -n "$field" ]] &&
             fields+=("$field")
     done
 
-    # A valid alias definition needs a canonical command and at least
-    # one alias.
-    if [[ "${#fields[@]}" -lt 2 ]]; then
-        return 0
-    fi
+    # Need:
+    #
+    #   canonical + at least one alias
+    #
+    [[ "${#fields[@]}" -lt 2 ]] && return 0
 
-    local canonical="${fields[0]}"
-    local alias
+    canonical="${fields[0]}"
 
     for alias in "${fields[@]:1}"; do
-        ACT_ALIASES+=(
-            "$alias"$'\t'"$canonical"
-        )
+        case "$type" in
+            i)
+                ACT_INTERNAL_ALIASES+=(
+                    "$alias"$'\t'"$canonical"
+                )
+                ;;
+
+            e)
+                ACT_EXTERNAL_ALIASES+=(
+                    "$alias"$'\t'"$canonical"
+                )
+                ;;
+        esac
     done
 }
 
 
 # ---------------------------------------------------------------------------
-# Load aliases
+# Load configuration
 # ---------------------------------------------------------------------------
 
 act_alias_load()
@@ -151,13 +151,12 @@ act_alias_load()
     local config
     local line
 
-    ACT_ALIASES=()
+    ACT_INTERNAL_ALIASES=()
+    ACT_EXTERNAL_ALIASES=()
 
     config="$(act_alias_config_path)"
 
-    if [[ ! -f "$config" ]]; then
-        return 0
-    fi
+    [[ -f "$config" ]] || return 0
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         act_alias_parse_line "$line"
@@ -168,63 +167,159 @@ act_alias_load()
 
 
 # ---------------------------------------------------------------------------
-# Find alias
+# Generic lookup
 # ---------------------------------------------------------------------------
 
 act_alias_lookup()
 {
-    local wanted="${1:-}"
+    local type="${1:-}"
+    local wanted="${2:-}"
     local entry
     local alias
-    local command
+    local canonical
 
-    for entry in "${ACT_ALIASES[@]}"; do
-        alias="${entry%%$'\t'*}"
-        command="${entry#*$'\t'}"
+    case "$type" in
+        i)
+            for entry in "${ACT_INTERNAL_ALIASES[@]}"; do
+                alias="${entry%%$'\t'*}"
+                canonical="${entry#*$'\t'}"
 
-        if [[ "$alias" == "$wanted" ]]; then
-            printf '%s\n' "$command"
-            return 0
-        fi
-    done
+                if [[ "$alias" == "$wanted" ]]; then
+                    printf '%s\n' "$canonical"
+                    return 0
+                fi
+            done
+            ;;
+
+        e)
+            for entry in "${ACT_EXTERNAL_ALIASES[@]}"; do
+                alias="${entry%%$'\t'*}"
+                canonical="${entry#*$'\t'}"
+
+                if [[ "$alias" == "$wanted" ]]; then
+                    printf '%s\n' "$canonical"
+                    return 0
+                fi
+            done
+            ;;
+    esac
 
     return 1
 }
 
 
 # ---------------------------------------------------------------------------
-# Check alias
+# Internal aliases
 # ---------------------------------------------------------------------------
 
-act_alias_exists()
+act_alias_internal_lookup()
 {
-    local wanted="${1:-}"
+    act_alias_lookup i "$1"
+}
 
-    act_alias_lookup "$wanted" >/dev/null 2>&1
+
+act_alias_internal_exists()
+{
+    act_alias_internal_lookup "$1" >/dev/null 2>&1
 }
 
 
 # ---------------------------------------------------------------------------
-# Debug output
+# External aliases
+# ---------------------------------------------------------------------------
+
+act_alias_external_lookup()
+{
+    act_alias_lookup e "$1"
+}
+
+
+act_alias_external_exists()
+{
+    act_alias_external_lookup "$1" >/dev/null 2>&1
+}
+
+
+# ---------------------------------------------------------------------------
+# Expand an external alias
+# ---------------------------------------------------------------------------
+#
+# Example:
+#
+#   paci firefox
+#
+# becomes:
+#
+#   pacman -S firefox
+#
+# The alias itself may contain multiple command tokens.
+#
+
+ACT_ALIAS_EXPANDED=()
+
+act_alias_expand_external()
+{
+    local token
+    local canonical
+    local command
+    local expanded=()
+
+    ACT_ALIAS_EXPANDED=()
+
+    for token in "$@"; do
+
+        if canonical="$(act_alias_external_lookup "$token")"; then
+            # shellcheck disable=SC2206
+            command=($canonical)
+
+            expanded+=("${command[@]}")
+        else
+            expanded+=("$token")
+        fi
+    done
+
+    ACT_ALIAS_EXPANDED=(
+        "${expanded[@]}"
+    )
+}
+
+
+# ---------------------------------------------------------------------------
+# Debug
 # ---------------------------------------------------------------------------
 
 act_alias_dump()
 {
     local entry
     local alias
-    local command
+    local canonical
 
-    for entry in "${ACT_ALIASES[@]}"; do
+    printf '%s\n' "Internal aliases:"
+
+    for entry in "${ACT_INTERNAL_ALIASES[@]}"; do
         alias="${entry%%$'\t'*}"
-        command="${entry#*$'\t'}"
+        canonical="${entry#*$'\t'}"
 
-        printf '%s -> %s\n' "$alias" "$command"
+        printf '  %s -> %s\n' \
+            "$alias" \
+            "$canonical"
+    done
+
+    printf '%s\n' "External aliases:"
+
+    for entry in "${ACT_EXTERNAL_ALIASES[@]}"; do
+        alias="${entry%%$'\t'*}"
+        canonical="${entry#*$'\t'}"
+
+        printf '  %s -> %s\n' \
+            "$alias" \
+            "$canonical"
     done
 }
 
 
 # ---------------------------------------------------------------------------
-# Automatically load configuration
+# Load configuration
 # ---------------------------------------------------------------------------
 
 act_alias_load
