@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 
 # act/install.sh
@@ -554,4 +553,3 @@ cat <<EOF
     install --help
     act install --help
 EOF
-```
