@@ -106,12 +106,19 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] ||
                 error "--prefix requires a directory"
 
+            [ -n "$2" ] ||
+                error "--prefix requires a non-empty directory"
+
             PREFIX="$2"
             shift 2
             ;;
 
         --prefix=*)
             PREFIX="${1#*=}"
+
+            [ -n "$PREFIX" ] ||
+                error "--prefix requires a non-empty directory"
+
             shift
             ;;
 
@@ -197,7 +204,7 @@ detect_shell() {
 }
 
 detect_shell_config() {
-    shell="$1"
+    local shell="$1"
 
     case "$shell" in
         zsh)
@@ -230,6 +237,10 @@ ACT_INIT_MARKER_END="# <<< act initialization <<<"
 add_shell_initialization() {
     [ "$NO_SHELL_CONFIG" -eq 0 ] || return 0
 
+    local shell
+    local config
+    local tmp
+
     shell="$(detect_shell)"
     config="$(detect_shell_config "$shell")"
 
@@ -250,13 +261,41 @@ add_shell_initialization() {
     touch "$config"
 
     # ---------------------------------------------------------------
-    # Update an existing act block if one exists.
+    # Remove any existing act initialization block.
+    #
+    # This allows reinstalling the library with a different prefix
+    # without leaving an obsolete PATH entry behind.
     # ---------------------------------------------------------------
 
     if grep -Fq "$ACT_INIT_MARKER_BEGIN" "$config"; then
-        verbose "act shell initialization already exists in $config"
-        return 0
+        verbose "updating existing act shell initialization in $config"
+
+        tmp="$(mktemp "${config}.act.XXXXXX")"
+
+        awk \
+            -v begin="$ACT_INIT_MARKER_BEGIN" \
+            -v end="$ACT_INIT_MARKER_END" '
+                $0 == begin {
+                    in_block = 1
+                    next
+                }
+
+                in_block && $0 == end {
+                    in_block = 0
+                    next
+                }
+
+                !in_block {
+                    print
+                }
+            ' "$config" > "$tmp"
+
+        mv "$tmp" "$config"
     fi
+
+    # ---------------------------------------------------------------
+    # Add the current act initialization block.
+    # ---------------------------------------------------------------
 
     {
         printf '\n%s\n' "$ACT_INIT_MARKER_BEGIN"
@@ -275,11 +314,12 @@ add_shell_initialization() {
 #
 # It:
 #   1. loads core
-#   2. loads parser
-#   3. loads aliases
-#   4. loads available actions
-#   5. identifies the action
-#   6. dispatches the action with the original ordered arguments
+#   2. loads aliases
+#   3. loads parser
+#   4. loads available action modules
+#   5. handles generic help
+#   6. identifies the action
+#   7. dispatches the action with the original ordered arguments
 #
 # IMPORTANT:
 #
@@ -308,7 +348,12 @@ source "\${ACT_LIB_DIR}/lib/core.sh"
 source "\${ACT_LIB_DIR}/tools/alias/alias.sh"
 source "\${ACT_LIB_DIR}/lib/parser.sh"
 
-# Load all installed action modules that exist.
+# Load installed action modules located directly in lib/.
+#
+# Action-specific implementations live here.
+# External commands such as pacman, flatpak, and AUR helpers are
+# invoked by those implementations as normal global commands.
+
 for _act_action in "\${ACT_LIB_DIR}/lib/"*.sh; do
     [ -f "\$_act_action" ] || continue
 
@@ -326,6 +371,45 @@ for _act_action in "\${ACT_LIB_DIR}/lib/"*.sh; do
             ;;
     esac
 done
+
+# ---------------------------------------------------------------------------
+# Generic act help
+# ---------------------------------------------------------------------------
+
+act_usage() {
+    cat <<'ACT_EOF'
+Usage:
+    act ACTION [arguments...]
+
+Actions:
+    install     Install applications
+
+Examples:
+    act install firefox
+    act install -p firefox
+    act install -p -a firefox -f spotify
+
+Internal aliases:
+    act -i ...
+    act ins ...
+
+Use:
+    act install --help
+
+for action-specific help.
+ACT_EOF
+}
+
+# ---------------------------------------------------------------------------
+# Generic help
+# ---------------------------------------------------------------------------
+
+case "\${1:-}" in
+    -h|--help)
+        act_usage
+        exit 0
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Parser configuration
@@ -508,6 +592,7 @@ check_path() {
 
     warn "${ACT_BIN_DIR} is not currently in PATH"
 
+    local shell
     shell="$(detect_shell)"
 
     case "$shell" in
