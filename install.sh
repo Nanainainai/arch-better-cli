@@ -26,7 +26,9 @@
 #   act --help
 #   install --help
 
+
 set -e
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -40,36 +42,49 @@ PREFIX="$DEFAULT_PREFIX"
 NO_SHELL_CONFIG=0
 VERBOSE=0
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(
+    CDPATH= cd -- "$(dirname -- "$0")" &&
+    pwd
+)"
+
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-info() {
+info()
+{
     printf 'act: %s\n' "$*"
 }
 
-warn() {
+
+warn()
+{
     printf 'act: warning: %s\n' "$*" >&2
 }
 
-error() {
+
+error()
+{
     printf 'act: error: %s\n' "$*" >&2
     exit 1
 }
 
-verbose() {
+
+verbose()
+{
     if [ "$VERBOSE" -eq 1 ]; then
         printf 'act: %s\n' "$*"
     fi
 }
 
+
 # ---------------------------------------------------------------------------
 # Help
 # ---------------------------------------------------------------------------
 
-usage() {
+usage()
+{
     cat <<'EOF'
 Usage:
     ./install.sh [options]
@@ -96,12 +111,14 @@ Uninstallation:
 EOF
 }
 
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
+
         --prefix)
             [ "$#" -ge 2 ] ||
                 error "--prefix requires a directory"
@@ -143,6 +160,50 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+
+# ---------------------------------------------------------------------------
+# Normalize prefix
+# ---------------------------------------------------------------------------
+#
+# Generated executables contain the absolute library path.
+#
+# This prevents:
+#
+#   --prefix ./something
+#
+# from creating a generated executable whose library path depends on the
+# current working directory.
+
+
+if [ "${PREFIX#/}" = "$PREFIX" ]; then
+    PREFIX="$(
+        CDPATH= cd -- "$PREFIX" 2>/dev/null &&
+        pwd
+    )" || {
+        mkdir -p "$PREFIX"
+
+        PREFIX="$(
+            CDPATH= cd -- "$PREFIX" &&
+            pwd
+        )"
+    }
+else
+    PREFIX="$(
+        CDPATH= cd -- "$(dirname -- "$PREFIX")" &&
+        printf '%s/%s\n' "$(pwd)" "$(basename -- "$PREFIX")"
+    )"
+
+    if [ ! -d "$PREFIX" ]; then
+        mkdir -p "$PREFIX"
+
+        PREFIX="$(
+            CDPATH= cd -- "$PREFIX" &&
+            pwd
+        )"
+    fi
+fi
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -152,6 +213,7 @@ ACT_BIN_DIR="${PREFIX}/bin"
 
 ACT_MAIN="${ACT_BIN_DIR}/act"
 ACT_INSTALL="${ACT_BIN_DIR}/install"
+
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -181,32 +243,39 @@ ACT_INSTALL="${ACT_BIN_DIR}/install"
 [ -f "$SCRIPT_DIR/tools/alias/alias.config" ] ||
     error "missing tools/alias/alias.config"
 
+
 # ---------------------------------------------------------------------------
 # Shell detection
 # ---------------------------------------------------------------------------
 
-detect_shell() {
+detect_shell()
+{
     if [ -n "${SHELL:-}" ]; then
         case "$SHELL" in
+
             */zsh)
                 printf 'zsh\n'
-                return
+                return 0
                 ;;
 
             */bash)
                 printf 'bash\n'
-                return
+                return 0
                 ;;
+
         esac
     fi
 
     printf 'unknown\n'
 }
 
-detect_shell_config() {
+
+detect_shell_config()
+{
     local shell="$1"
 
     case "$shell" in
+
         zsh)
             printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc"
             ;;
@@ -224,8 +293,10 @@ detect_shell_config() {
         *)
             printf '%s\n' ""
             ;;
+
     esac
 }
+
 
 # ---------------------------------------------------------------------------
 # Shell initialization
@@ -234,7 +305,9 @@ detect_shell_config() {
 ACT_INIT_MARKER_BEGIN="# >>> act initialization >>>"
 ACT_INIT_MARKER_END="# <<< act initialization <<<"
 
-add_shell_initialization() {
+
+add_shell_initialization()
+{
     [ "$NO_SHELL_CONFIG" -eq 0 ] || return 0
 
     local shell
@@ -247,6 +320,7 @@ add_shell_initialization() {
     case "$shell" in
         bash|zsh)
             ;;
+
         *)
             warn "could not determine Bash/Zsh configuration file"
             warn "add this manually to your shell configuration:"
@@ -257,17 +331,21 @@ add_shell_initialization() {
 
     [ -n "$config" ] || return 0
 
-    mkdir -p "$(dirname "$config")"
+    mkdir -p "$(dirname -- "$config")"
     touch "$config"
 
+
     # ---------------------------------------------------------------
-    # Remove any existing act initialization block.
+    # Remove an existing complete act initialization block.
     #
-    # This allows reinstalling the library with a different prefix
-    # without leaving an obsolete PATH entry behind.
+    # Only remove the block when both markers exist.
+    # This avoids deleting the remainder of a shell configuration
+    # file if a damaged/incomplete marker is present.
     # ---------------------------------------------------------------
 
-    if grep -Fq "$ACT_INIT_MARKER_BEGIN" "$config"; then
+    if grep -Fq "$ACT_INIT_MARKER_BEGIN" "$config" &&
+       grep -Fq "$ACT_INIT_MARKER_END" "$config"; then
+
         verbose "updating existing act shell initialization in $config"
 
         tmp="$(mktemp "${config}.act.XXXXXX")"
@@ -291,7 +369,14 @@ add_shell_initialization() {
             ' "$config" > "$tmp"
 
         mv "$tmp" "$config"
+
+    elif grep -Fq "$ACT_INIT_MARKER_BEGIN" "$config"; then
+
+        warn "found incomplete act shell initialization in $config"
+        warn "leaving it unchanged"
+
     fi
+
 
     # ---------------------------------------------------------------
     # Add the current act initialization block.
@@ -306,6 +391,7 @@ add_shell_initialization() {
     info "updated $config"
 }
 
+
 # ---------------------------------------------------------------------------
 # Generate `act`
 # ---------------------------------------------------------------------------
@@ -316,14 +402,14 @@ add_shell_initialization() {
 #   1. loads core
 #   2. loads aliases
 #   3. loads parser
-#   4. loads available action modules
+#   4. loads available action implementations
 #   5. handles generic help
 #   6. identifies the action
 #   7. dispatches the action with the original ordered arguments
 #
 # IMPORTANT:
 #
-# The dispatcher must NOT reconstruct the arguments from:
+# The dispatcher must NOT reconstruct arguments from:
 #
 #   ACT_PARSED_SUBCOMMANDS
 #   ACT_PARSED_FLAGS
@@ -334,11 +420,12 @@ add_shell_initialization() {
 #
 #   install -p -a firefox -f spotify
 #
-# Instead, the dispatcher identifies the action and then passes the original
-# arguments after that action directly to the action implementation.
+# Instead, the dispatcher identifies the action and passes the original
+# argument ordering to the action implementation.
 #
 
-generate_act_command() {
+generate_act_command()
+{
     cat > "$ACT_MAIN" <<EOF
 #!/usr/bin/env bash
 
@@ -348,11 +435,13 @@ source "\${ACT_LIB_DIR}/lib/core.sh"
 source "\${ACT_LIB_DIR}/tools/alias/alias.sh"
 source "\${ACT_LIB_DIR}/lib/parser.sh"
 
-# Load installed action modules located directly in lib/.
+# Load installed action implementations located directly in lib/.
 #
 # Action-specific implementations live here.
-# External commands such as pacman, flatpak, and AUR helpers are
-# invoked by those implementations as normal global commands.
+#
+# External programs such as pacman, flatpak, and AUR helpers are
+# normal global commands. They are invoked by action integrations.
+# They are NOT libraries loaded or copied by act.
 
 for _act_action in "\${ACT_LIB_DIR}/lib/"*.sh; do
     [ -f "\$_act_action" ] || continue
@@ -372,11 +461,13 @@ for _act_action in "\${ACT_LIB_DIR}/lib/"*.sh; do
     esac
 done
 
+
 # ---------------------------------------------------------------------------
 # Generic act help
 # ---------------------------------------------------------------------------
 
-act_usage() {
+act_usage()
+{
     cat <<'ACT_EOF'
 Usage:
     act ACTION [arguments...]
@@ -400,6 +491,7 @@ for action-specific help.
 ACT_EOF
 }
 
+
 # ---------------------------------------------------------------------------
 # Generic help
 # ---------------------------------------------------------------------------
@@ -411,54 +503,19 @@ case "\${1:-}" in
         ;;
 esac
 
+
 # ---------------------------------------------------------------------------
 # Parser configuration
 # ---------------------------------------------------------------------------
-#
-# The generic parser only needs to know about actions here.
-#
-# Install-specific source selectors such as:
-#
-#   pacman
-#   aur
-#   flatpak
-#   web
-#   -p
-#   -a
-#   -f
-#   -w
-#
-# are interpreted by lib/install.sh.
-#
-# Keeping them out of the generic parser prevents install-specific syntax
-# from becoming global act syntax.
-#
 
 ACT_PARSER_ACTIONS=(
     install
 )
 
+
 # ---------------------------------------------------------------------------
-# Preserve the original argv.
+# Preserve original argv
 # ---------------------------------------------------------------------------
-#
-# The action parser may inspect the arguments, but action-specific modules
-# need the original ordering.
-#
-# Example:
-#
-#   act install -p -a firefox -f spotify
-#
-# must reach act_install as:
-#
-#   -p -a firefox -f spotify
-#
-# and NOT as:
-#
-#   pacman aur flatpak firefox spotify
-#
-# because install source selectors are scoped by their position.
-#
 
 _act_original_args=( "\$@" )
 
@@ -468,12 +525,38 @@ if ! act_parser_require_action; then
     exit 2
 fi
 
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+#
+# ACT_PARSED_ACTION contains the canonical action.
+#
+# The original argv is retained because install-specific syntax is
+# positional/scoped and must not be reconstructed from parsed arrays.
+#
+# Examples:
+#
+#   act install firefox
+#       -> act_install firefox
+#
+#   act -i firefox
+#       -> act_install firefox
+#
+#   act ins firefox
+#       -> act_install firefox
+#
+#   act install -p -a firefox -f spotify
+#       -> act_install -p -a firefox -f spotify
+#
+
 case "\$ACT_PARSED_ACTION" in
+
     install)
-        # Remove the action from the original argv.
-        # Everything after it is passed unchanged to act_install.
         if [ "\${#_act_original_args[@]}" -gt 0 ]; then
-            _act_original_args=( "\${_act_original_args[@]:1}" )
+            _act_original_args=(
+                "\${_act_original_args[@]:1}"
+            )
         fi
 
         act_install "\${_act_original_args[@]}"
@@ -483,6 +566,7 @@ case "\$ACT_PARSED_ACTION" in
         act_error "Unknown action: \$ACT_PARSED_ACTION"
         exit 2
         ;;
+
 esac
 EOF
 
@@ -491,13 +575,12 @@ EOF
     verbose "generated $ACT_MAIN"
 }
 
+
 # ---------------------------------------------------------------------------
 # Generate `install`
 # ---------------------------------------------------------------------------
 #
 # `install` is a convenience executable for the install action.
-#
-# It bypasses action selection and invokes the same runtime implementation.
 #
 # Therefore:
 #
@@ -509,9 +592,10 @@ EOF
 #
 # both reach act_install.
 #
-# The arguments are passed unchanged.
+# Arguments are passed unchanged.
 
-generate_install_command() {
+generate_install_command()
+{
     cat > "$ACT_INSTALL" <<EOF
 #!/usr/bin/env bash
 
@@ -530,11 +614,13 @@ EOF
     verbose "generated $ACT_INSTALL"
 }
 
+
 # ---------------------------------------------------------------------------
 # Install library
 # ---------------------------------------------------------------------------
 
-install_library() {
+install_library()
+{
     info "installing ${ACT_NAME}"
 
     mkdir -p "$ACT_LIB_DIR"
@@ -544,6 +630,7 @@ install_library() {
     verbose "library: $ACT_LIB_DIR"
     verbose "bin: $ACT_BIN_DIR"
 
+
     # ---------------------------------------------------------------
     # Library
     # ---------------------------------------------------------------
@@ -551,12 +638,14 @@ install_library() {
     rm -rf "$ACT_LIB_DIR/lib"
     cp -R "$SCRIPT_DIR/lib" "$ACT_LIB_DIR/"
 
+
     # ---------------------------------------------------------------
     # Tools
     # ---------------------------------------------------------------
 
     rm -rf "$ACT_LIB_DIR/tools"
     cp -R "$SCRIPT_DIR/tools" "$ACT_LIB_DIR/"
+
 
     # ---------------------------------------------------------------
     # Optional share directory
@@ -566,6 +655,7 @@ install_library() {
         rm -rf "$ACT_LIB_DIR/share"
         cp -R "$SCRIPT_DIR/share" "$ACT_LIB_DIR/"
     fi
+
 
     # ---------------------------------------------------------------
     # Generate public commands
@@ -579,11 +669,13 @@ install_library() {
     info "installed install to $ACT_INSTALL"
 }
 
+
 # ---------------------------------------------------------------------------
 # PATH check
 # ---------------------------------------------------------------------------
 
-check_path() {
+check_path()
+{
     case ":${PATH:-}:" in
         *":${ACT_BIN_DIR}:"*)
             return 0
@@ -596,6 +688,7 @@ check_path() {
     shell="$(detect_shell)"
 
     case "$shell" in
+
         zsh|bash)
             warn "restart your shell or run:"
             warn "source \"$(detect_shell_config "$shell")\""
@@ -605,8 +698,10 @@ check_path() {
             warn "add this to your shell configuration:"
             warn "export PATH=\"${ACT_BIN_DIR}:\$PATH\""
             ;;
+
     esac
 }
+
 
 # ---------------------------------------------------------------------------
 # Main
